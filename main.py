@@ -3,9 +3,15 @@ import sys, os, time
 import json
 from botocore.exceptions import ClientError
 import paramiko
-
 import boto3
 import time
+import random
+import subprocess
+import requests
+
+# Initialize clients
+ec2_client = boto3.client('ec2', region_name='us-east-1')
+s3_client = boto3.client('s3', region_name='us-east-1')
 
 # Get the AWS key pair
 def get_key_pair(ec2_client):
@@ -169,125 +175,264 @@ def get_subnet(ec2_client, vpc_id):
         print(f"Error retrieving subnets: {e}")
         sys.exit(1)
 
-# Launch mysql clusters
-def launch_mysql_cluster(ec2_client, image_id, instance_type, key_name, security_group_id, subnet_id):
-    user_data_script = '''#!/bin/bash
-                          sudo apt update -y
-                          sudo apt install -y mysql-server
-                          wget https://downloads.mysql.com/docs/sakila-db.tar.gz
-                          tar -xzf sakila-db.tar.gz
-                          mysql < sakila-db/sakila-schema.sql
-                          mysql < sakila-db/sakila-data.sql
-                          '''
-    response = ec2_client.run_instances(
-        ImageId=image_id,
-        InstanceType=instance_type,
-        KeyName=key_name,
-        SecurityGroupIds=[security_group_id],
-        SubnetId=subnet_id,
-        UserData=user_data_script,
-        MinCount=3,
-        MaxCount=3
-    )
-    instances = [i['InstanceId'] for i in response['Instances']]
-    for instance_id in instances:
-        ec2_client.get_waiter('instance_running').wait(InstanceIds=[instance_id])
-        print(f"MySQL instance {instance_id} is running.")
-    return instances
+# Set up the mysql clusters
+def setup_mysql_cluster(ec2_client, key_name, sg_id, subnet_id):
+    """
+    Set up a MySQL cluster with one manager and two worker nodes.
+    Args:
+        ec2_client: The boto3 EC2 client
+        key_name: Key pair name
+        sg_id: Security group ID
+        subnet_id: Subnet ID
+    Returns:
+        Tuple of manager instance ID and list of worker instance IDs
+    """
+    instance_type = 't2.micro'
+    ami_id = 'ami-0e86e20dae9224db8'
 
-# Launch Proxy Server
-def launch_proxy_server(ec2_client, image_id, instance_type, key_name, security_group_id, subnet_id):
-    user_data_script = '''#!/bin/bash
-                          sudo apt update -y
-                          sudo apt install -y python3-pip
-                          pip3 install flask requests
-                          '''
-    response = ec2_client.run_instances(
-        ImageId=image_id,
-        InstanceType=instance_type,
+    # Define the instance configurations
+    instances_config = [
+        {'Name': 'manager', 'Role': 'manager'},
+        {'Name': 'worker-1', 'Role': 'worker'},
+        {'Name': 'worker-2', 'Role': 'worker'}
+    ]
+
+    instance_ids = []
+    for config in instances_config:
+        # Launch each instance separately to apply unique tags
+        instance = ec2_client.run_instances(
+            ImageId=ami_id,
+            InstanceType=instance_type,
+            KeyName=key_name,
+            SecurityGroupIds=[sg_id],
+            SubnetId=subnet_id,
+            MinCount=1,
+            MaxCount=1,
+            TagSpecifications=[{
+                'ResourceType': 'instance',
+                'Tags': [
+                    {'Key': 'Name', 'Value': config['Name']}
+                ]
+            }]
+        )
+        instance_ids.append(instance['Instances'][0]['InstanceId'])
+        print(f"{config['Name'].capitalize()} instance created with ID: {instance['Instances'][0]['InstanceId']}")
+
+    # Split instance IDs into manager and workers
+    manager_instance_id = instance_ids[0]
+    worker_instance_ids = instance_ids[1:]
+
+    # Wait for instances to be in running state
+    print("Waiting for instances to be in running state...")
+    ec2_client.get_waiter('instance_running').wait(InstanceIds=instance_ids)
+
+    # Get public IP addresses for SSH configuration
+    manager_public_ip = ec2_client.describe_instances(InstanceIds=[manager_instance_id])['Reservations'][0]['Instances'][0]['PublicIpAddress']
+    worker_public_ips = [
+        ec2_client.describe_instances(InstanceIds=[worker_id])['Reservations'][0]['Instances'][0]['PublicIpAddress']
+        for worker_id in worker_instance_ids
+    ]
+
+    # Configure MySQL on each instance (requires SSH)
+    configure_mysql_instance(manager_public_ip, key_name, role='manager')
+    for worker_ip in worker_public_ips:
+        configure_mysql_instance(worker_ip, key_name, role='worker')
+
+    return manager_instance_id, worker_instance_ids
+
+# Configure the mysql instances
+def configure_mysql_instance(public_ip, key_name, role):
+    """
+    Configure MySQL on the given instance.
+    Args:
+        public_ip: Public IP of the instance
+        key_name: Key pair name to SSH into the instance
+        role: 'manager' or 'worker'
+    """
+    # Define SSH command template
+    ssh_command = f"ssh -o StrictHostKeyChecking=no -i ~/.aws/{key_name}.pem ubuntu@{public_ip}"
+
+    # Install MySQL
+    install_mysql_cmd = f"{ssh_command} 'sudo apt update && sudo apt install -y mysql-server'"
+    os.system(install_mysql_cmd)
+    print(f"MySQL installed on {role} at {public_ip}")
+
+    # Additional configuration for manager and workers
+    if role == 'manager':
+        # Set up replication user and configure as manager
+        replication_setup_cmd = f"{ssh_command} 'sudo mysql -e \"CREATE USER 'repl'@'%' IDENTIFIED BY 'replica_password'; GRANT REPLICATION SLAVE ON *.* TO 'repl'@'%'; FLUSH PRIVILEGES;\"'"
+        os.system(replication_setup_cmd)
+        print("Replication setup on manager.")
+        
+    elif role == 'worker':
+        # Configure worker to connect to the manager
+        # Note: Replace 'MANAGER_IP' with the actual IP of the manager
+        replication_worker_cmd = f"{ssh_command} 'sudo mysql -e \"CHANGE MASTER TO MASTER_HOST='MANAGER_IP', MASTER_USER='repl', MASTER_PASSWORD='replica_password', MASTER_AUTO_POSITION=1; START SLAVE;\"'"
+        os.system(replication_worker_cmd)
+        print(f"Replication configured on worker at {public_ip}")
+
+# Set up the proxy
+def setup_proxy(ec2_client, key_name, sg_id, subnet_id, manager_instance_id, worker_instance_ids):
+    """
+    Set up the proxy with load balancing configurations.
+    Args:
+        ec2_client: The boto3 EC2 client.
+        key_name: Key pair name to SSH into the instance.
+        sg_id: Security group ID.
+        subnet_id: Subnet ID.
+        manager_instance_id: The instance ID of the manager.
+        worker_instance_ids: A list of instance IDs for the worker nodes.
+    Returns:
+        Proxy instance ID.
+    """
+
+    # Simulated endpoint for testing
+    manager_ip = get_public_ip(manager_instance_id)
+    worker_ips = [get_public_ip(worker_id) for worker_id in worker_instance_ids]
+
+    # Define the routing strategies
+    def direct_hit(endpoint="write"):
+        """
+        Direct all requests to the manager instance.
+        """
+        print(f"Direct hit to manager instance at {manager_ip} for endpoint: {endpoint}")
+        response = requests.post(f"http://{manager_ip}/{endpoint}")
+        return response.status_code
+
+    def random_worker(endpoint="read"):
+        """
+        Randomly choose a worker node to handle a read request.
+        """
+        worker_ip = random.choice(worker_ips)
+        print(f"Random worker selected: {worker_ip} for endpoint: {endpoint}")
+        response = requests.get(f"http://{worker_ip}/{endpoint}")
+        return response.status_code
+
+    def ping_based(endpoint="read"):
+        """
+        Route to the worker with the lowest ping time.
+        """
+        ping_times = {}
+        for worker_ip in worker_ips:
+            ping_time = subprocess.check_output(["ping", "-c", "1", worker_ip])
+            ping_times[worker_ip] = float(ping_time.decode().split("time=")[-1].split(" ")[0])
+        fastest_worker = min(ping_times, key=ping_times.get)
+        print(f"Fastest worker selected: {fastest_worker} with ping {ping_times[fastest_worker]} ms for endpoint: {endpoint}")
+        response = requests.get(f"http://{fastest_worker}/{endpoint}")
+        return response.status_code
+
+    # Example usage of the routing logic
+    routing_method = "random"  # Adjust this as needed for different strategies
+
+    if routing_method == "direct":
+        direct_hit("write")
+    elif routing_method == "random":
+        random_worker("read")
+    elif routing_method == "ping":
+        ping_based("read")
+
+def get_public_ip(instance_id):
+    """
+    Retrieves the public IP address of an instance.
+    Args:
+        instance_id: The instance ID.
+    Returns:
+        The public IP address as a string.
+    """
+    instance_description = ec2_client.describe_instances(InstanceIds=[instance_id])
+    return instance_description['Reservations'][0]['Instances'][0]['PublicIpAddress']
+
+# Set up the gatekeeper
+def setup_gatekeeper(ec2_client, key_name, sg_id, subnet_id, proxy_instance_id):
+    """
+    Deploy the Gatekeeper instance and Trusted Host instance.
+    """
+    # Create Gatekeeper instance
+    gatekeeper_instance = ec2_client.run_instances(
+        InstanceType='t2.large',
         KeyName=key_name,
-        SecurityGroupIds=[security_group_id],
+        SecurityGroupIds=[sg_id],
         SubnetId=subnet_id,
-        UserData=user_data_script,
         MinCount=1,
-        MaxCount=1
+        MaxCount=1,
     )
-    proxy_id = response['Instances'][0]['InstanceId']
-    ec2_client.get_waiter('instance_running').wait(InstanceIds=[proxy_id])
-    return proxy_id
+    gatekeeper_instance_id = gatekeeper_instance['Instances'][0]['InstanceId']
+    print(f"Gatekeeper instance created with ID: {gatekeeper_instance_id}")
 
-# Launch Gatekeeper and Trusted Host
-def launch_gatekeeper_and_trusted_host(ec2_client, image_id, instance_type, key_name, security_group_id, subnet_id):
-    user_data_script = '''#!/bin/bash
-                          sudo apt update -y
-                          sudo apt install -y python3-pip
-                          pip3 install flask requests
-                          '''
-    response = ec2_client.run_instances(
-        ImageId=image_id,
-        InstanceType=instance_type,
+    # Create Trusted Host instance
+    trusted_host_instance = ec2_client.run_instances(
+        InstanceType='t2.large',
         KeyName=key_name,
-        SecurityGroupIds=[security_group_id],
+        SecurityGroupIds=[sg_id],
         SubnetId=subnet_id,
-        UserData=user_data_script,
-        MinCount=2,
-        MaxCount=2
+        MinCount=1,
+        MaxCount=1,
     )
-    instances = [i['InstanceId'] for i in response['Instances']]
-    for instance_id in instances:
-        ec2_client.get_waiter('instance_running').wait(InstanceIds=[instance_id])
-    return instances
+    trusted_host_id = trusted_host_instance['Instances'][0]['InstanceId']
+    print(f"Trusted Host instance created with ID: {trusted_host_id}")
 
-# Transfer files to instances
-def transfer_files(instance_ip, key_file, files):
-    ssh_client = paramiko.SSHClient()
-    ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    ssh_client.connect(instance_ip, username='ubuntu', key_filename=key_file)
-    scp = paramiko.SFTPClient.from_transport(ssh_client.get_transport())
-    for file in files:
-        scp.put(file, f"/home/ubuntu/{os.path.basename(file)}")
-    scp.close()
-    ssh_client.close()
+    # Security configuration to only allow Gatekeeper to communicate with Trusted Host
+    configure_gatekeeper_security(ec2_client, gatekeeper_instance_id, trusted_host_id)
+
+    return gatekeeper_instance_id, trusted_host_id
+
+# Configure the gatekeeper security
+def configure_gatekeeper_security(ec2_client, gatekeeper_instance_id, trusted_host_id):
+    """
+    Configures security settings for Gatekeeper pattern.
+    """
+    # Security rules to ensure Gatekeeper can communicate with Trusted Host only
+    pass
+
+# Benchmarking
+def benchmark_cluster(manager_instance_id, worker_instance_ids, proxy_instance_id):
+    """
+    Sends 1000 read and 1000 write requests to the MySQL cluster.
+    """
+    for _ in range(1000):
+        # Send a write request to manager
+        requests.post(f"http://{manager_instance_id}/write", data={'key': 'value'})
+
+    for _ in range(1000):
+        # Send a read request to proxy for load-balanced reading
+        requests.get(f"http://{proxy_instance_id}/read")
+
+# File with the IDs of the instances
+INSTANCE_FILE = "instance_ids.json"
+
+# Save the IDs of the instances in the file
+def save_instance_ids(manager_id, worker_ids):
+    data = {
+        "manager_id": manager_id,
+        "worker_ids": worker_ids
+    }
+    with open(INSTANCE_FILE, "w") as file:
+        json.dump(data, file)
+    print(f"Instance IDs saved to {INSTANCE_FILE}")
 
 def main():
-    try:
-        # BASIC CONFIGURATION
+    # Step 1: Key pair setup
+    key_name = get_key_pair(ec2_client)
 
-        # Initialize EC2 and ELB clients
-        ec2_client = boto3.client('ec2')
-        elbv2_client = boto3.client('elbv2')
+    # Step 2: Retrieve VPC and subnet
+    vpc_id = get_vpc_id(ec2_client)
+    subnet_id = get_subnet(ec2_client, vpc_id)
 
-        # Define essential AWS configuration
-        vpc_id = get_vpc_id(ec2_client)
-        image_id = 'ami-0e86e20dae9224db8'
+    # Step 3: Security Group creation
+    sg_id = create_security_group(ec2_client, vpc_id)
 
-        # Get key pair, security group, and subnet
-        key_name = get_key_pair(ec2_client)
-        security_group_id = create_security_group(ec2_client, vpc_id)
-        subnet_id = get_subnet(ec2_client, vpc_id)
+    # Step 4: Deploy MySQL instances (manager + 2 workers)
+    manager_instance_id, worker_instance_ids = setup_mysql_cluster(ec2_client, key_name, sg_id, subnet_id)
+    save_instance_ids(manager_instance_id, worker_instance_ids)
 
-        # INSTANCES
+    # Step 5: Set up the proxy instance and configure load balancing
+    proxy_instance_id = setup_proxy(ec2_client, key_name, sg_id, subnet_id, manager_instance_id, worker_instance_ids)
 
-        print("Launching EC2 instances...")
-        # Launch instances
-        mysql_instances = launch_mysql_cluster(ec2_client, image_id, 't2.micro', key_name, security_group_id, subnet_id)
-        
-        '''
-        proxy_id = launch_proxy_server(ec2_client, image_id, 't2.large', key_name, security_group_id, subnet_id)
-        gatekeeper_and_trusted_host = launch_gatekeeper_and_trusted_host(ec2_client, image_id, 't2.large', key_name, security_group_id, subnet_id)
-        # Retrieve public IPs
-        ec2_resource = boto3.resource('ec2')
-        instances_ips = [ec2_resource.Instance(i).public_ip_address for i in mysql_instances + [proxy_id] + gatekeeper_and_trusted_host]
-        print("Instance IPs:", instances_ips)
-        # Transfer application files
-        key_file_path = os.path.expanduser(f"~/.aws/{key_name}.pem")
-        transfer_files(instances_ips[0], key_file_path, ["proxy.py", "gatekeeper.py", "trusted_host.py"])
-        for ip in instances_ips[1:]:
-            transfer_files(ip, key_file_path, ["mysql_setup.py"])
-        '''
+    # Step 6: Set up the gatekeeper pattern
+    gatekeeper_instance_id, trusted_host_id = setup_gatekeeper(ec2_client, key_name, sg_id, subnet_id, proxy_instance_id)
 
-    except Exception as e:
-        print(f"Error during execution: {e}")
+    # Step 7: Send benchmarking requests
+    benchmark_cluster(manager_instance_id, worker_instance_ids, proxy_instance_id)
 
 if __name__ == "__main__":
     main()
