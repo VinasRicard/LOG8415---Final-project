@@ -94,7 +94,8 @@ def create_security_group(ec2_client, vpc_id, description="My Security Group"):
         {'protocol': 'tcp', 'port_range': 5000, 'source': '0.0.0.0/0'},
         {'protocol': 'tcp', 'port_range': 5001, 'source': '0.0.0.0/0'},
         {'protocol': 'tcp', 'port_range': 22, 'source': '0.0.0.0/0'},
-        {'protocol': 'tcp', 'port_range': 8000, 'source': '96.127.217.181/32'}
+        {'protocol': 'tcp', 'port_range': 8000, 'source': '96.127.217.181/32'},
+        {'protocol': 'tcp', 'port_range': 0, 'source': '0.0.0.0/0'}
     ]
 
     try:
@@ -177,18 +178,36 @@ def get_subnet(ec2_client, vpc_id):
 
 # Set up the mysql clusters
 def setup_mysql_cluster(ec2_client, key_name, sg_id, subnet_id):
-    """
-    Set up a MySQL cluster with one manager and two worker nodes.
-    Args:
-        ec2_client: The boto3 EC2 client
-        key_name: Key pair name
-        sg_id: Security group ID
-        subnet_id: Subnet ID
-    Returns:
-        Tuple of manager instance ID and list of worker instance IDs
-    """
     instance_type = 't2.micro'
     ami_id = 'ami-0e86e20dae9224db8'
+
+    # User Data script to set up MySQL, configure replication, and install Sakila
+    user_data_script = r'''#!/bin/bash
+    # Update and install MySQL
+    sudo apt update -y
+    sudo apt install -y mysql-server wget
+
+    # Enable GTID-based replication for MySQL
+    sudo sed -i '/\[mysqld\]/a gtid_mode=ON' /etc/mysql/mysql.conf.d/mysqld.cnf
+    sudo sed -i '/\[mysqld\]/a enforce_gtid_consistency=ON' /etc/mysql/mysql.conf.d/mysqld.cnf
+    sudo sed -i '/\[mysqld\]/a log_slave_updates=ON' /etc/mysql/mysql.conf.d/mysqld.cnf
+    sudo sed -i '/\[mysqld\]/a binlog_format=ROW' /etc/mysql/mysql.conf.d/mysqld.cnf
+    sudo systemctl restart mysql
+
+    # Configure MySQL for replication if this is the manager
+    if [[ $(hostname) == *"manager"* ]]; then
+        sudo mysql -e "CREATE USER 'repl'@'%' IDENTIFIED BY 'replica_password';"
+        sudo mysql -e "GRANT REPLICATION SLAVE ON *.* TO 'repl'@'%';"
+        sudo mysql -e "FLUSH PRIVILEGES;"
+    fi
+
+    # Download and load Sakila database
+    wget https://downloads.mysql.com/docs/sakila-db.tar.gz
+    tar -xvf sakila-db.tar.gz
+    sudo mysql < sakila-db/sakila-schema.sql
+    sudo mysql < sakila-db/sakila-data.sql
+    '''
+
 
     # Define the instance configurations
     instances_config = [
@@ -199,7 +218,7 @@ def setup_mysql_cluster(ec2_client, key_name, sg_id, subnet_id):
 
     instance_ids = []
     for config in instances_config:
-        # Launch each instance separately to apply unique tags
+        # Launch each instance with user_data script
         instance = ec2_client.run_instances(
             ImageId=ami_id,
             InstanceType=instance_type,
@@ -213,63 +232,21 @@ def setup_mysql_cluster(ec2_client, key_name, sg_id, subnet_id):
                 'Tags': [
                     {'Key': 'Name', 'Value': config['Name']}
                 ]
-            }]
+            }],
+            UserData=user_data_script  # Pass the user_data script here
         )
         instance_ids.append(instance['Instances'][0]['InstanceId'])
         print(f"{config['Name'].capitalize()} instance created with ID: {instance['Instances'][0]['InstanceId']}")
-
-    # Split instance IDs into manager and workers
-    manager_instance_id = instance_ids[0]
-    worker_instance_ids = instance_ids[1:]
 
     # Wait for instances to be in running state
     print("Waiting for instances to be in running state...")
     ec2_client.get_waiter('instance_running').wait(InstanceIds=instance_ids)
 
-    # Get public IP addresses for SSH configuration
-    manager_public_ip = ec2_client.describe_instances(InstanceIds=[manager_instance_id])['Reservations'][0]['Instances'][0]['PublicIpAddress']
-    worker_public_ips = [
-        ec2_client.describe_instances(InstanceIds=[worker_id])['Reservations'][0]['Instances'][0]['PublicIpAddress']
-        for worker_id in worker_instance_ids
-    ]
-
-    # Configure MySQL on each instance (requires SSH)
-    configure_mysql_instance(manager_public_ip, key_name, role='manager')
-    for worker_ip in worker_public_ips:
-        configure_mysql_instance(worker_ip, key_name, role='worker')
+    # Fetch and print public IPs for manager and workers
+    manager_instance_id = instance_ids[0]
+    worker_instance_ids = instance_ids[1:]
 
     return manager_instance_id, worker_instance_ids
-
-# Configure the mysql instances
-def configure_mysql_instance(public_ip, key_name, role):
-    """
-    Configure MySQL on the given instance.
-    Args:
-        public_ip: Public IP of the instance
-        key_name: Key pair name to SSH into the instance
-        role: 'manager' or 'worker'
-    """
-    # Define SSH command template
-    ssh_command = f"ssh -o StrictHostKeyChecking=no -i ~/.aws/{key_name}.pem ubuntu@{public_ip}"
-
-    # Install MySQL
-    install_mysql_cmd = f"{ssh_command} 'sudo apt update && sudo apt install -y mysql-server'"
-    os.system(install_mysql_cmd)
-    print(f"MySQL installed on {role} at {public_ip}")
-
-    # Additional configuration for manager and workers
-    if role == 'manager':
-        # Set up replication user and configure as manager
-        replication_setup_cmd = f"{ssh_command} 'sudo mysql -e \"CREATE USER 'repl'@'%' IDENTIFIED BY 'replica_password'; GRANT REPLICATION SLAVE ON *.* TO 'repl'@'%'; FLUSH PRIVILEGES;\"'"
-        os.system(replication_setup_cmd)
-        print("Replication setup on manager.")
-        
-    elif role == 'worker':
-        # Configure worker to connect to the manager
-        # Note: Replace 'MANAGER_IP' with the actual IP of the manager
-        replication_worker_cmd = f"{ssh_command} 'sudo mysql -e \"CHANGE MASTER TO MASTER_HOST='MANAGER_IP', MASTER_USER='repl', MASTER_PASSWORD='replica_password', MASTER_AUTO_POSITION=1; START SLAVE;\"'"
-        os.system(replication_worker_cmd)
-        print(f"Replication configured on worker at {public_ip}")
 
 # Set up the proxy
 def setup_proxy(ec2_client, key_name, sg_id, subnet_id, manager_instance_id, worker_instance_ids):
