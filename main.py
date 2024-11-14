@@ -196,18 +196,29 @@ def setup_mysql_cluster(ec2_client, key_name, sg_id, subnet_id):
 
     # Configure MySQL for replication if this is the manager
     if [[ $(hostname) == *"manager"* ]]; then
+        # Setup replication user on the manager
         sudo mysql -e "CREATE USER 'repl'@'%' IDENTIFIED BY 'replica_password';"
         sudo mysql -e "GRANT REPLICATION SLAVE ON *.* TO 'repl'@'%';"
         sudo mysql -e "FLUSH PRIVILEGES;"
+        
+        # Get manager's private IP to use for workers' connection
+        manager_private_ip=$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)
+        echo "Manager IP: $manager_private_ip" > /tmp/manager_ip.txt
+    else
+        # Configure worker to connect to the manager
+        # Wait for /tmp/manager_ip.txt file to be created
+        while [ ! -f /tmp/manager_ip.txt ]; do sleep 5; done
+        manager_private_ip=$(cat /tmp/manager_ip.txt)
+        
+        sudo mysql -e "CHANGE MASTER TO MASTER_HOST='$manager_private_ip', MASTER_USER='repl', MASTER_PASSWORD='replica_password', MASTER_AUTO_POSITION=1; START SLAVE;"
     fi
 
-    # Download and load Sakila database
+    # Download and load Sakila database on all instances
     wget https://downloads.mysql.com/docs/sakila-db.tar.gz
     tar -xvf sakila-db.tar.gz
     sudo mysql < sakila-db/sakila-schema.sql
     sudo mysql < sakila-db/sakila-data.sql
     '''
-
 
     # Define the instance configurations
     instances_config = [
@@ -249,6 +260,7 @@ def setup_mysql_cluster(ec2_client, key_name, sg_id, subnet_id):
     return manager_instance_id, worker_instance_ids
 
 # Set up the proxy
+# NEEDS TO BE REDONE!!!!!
 def setup_proxy(ec2_client, key_name, sg_id, subnet_id, manager_instance_id, worker_instance_ids):
     """
     Set up the proxy with load balancing configurations.
@@ -320,6 +332,7 @@ def get_public_ip(instance_id):
     return instance_description['Reservations'][0]['Instances'][0]['PublicIpAddress']
 
 # Set up the gatekeeper
+# NEEDS TO BE REDONE!!!!!!
 def setup_gatekeeper(ec2_client, key_name, sg_id, subnet_id, proxy_instance_id):
     """
     Deploy the Gatekeeper instance and Trusted Host instance.
