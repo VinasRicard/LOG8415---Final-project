@@ -501,6 +501,7 @@ def configure_gatekeeper_security(ec2_client, sg_id, trusted_host_ip):
     '''
 
 # Benchmarking
+'''
 def benchmark_cluster(manager_instance_id, worker_instance_ids, proxy_instance_id):
     """
     Sends 1000 read and 1000 write requests to the MySQL cluster.
@@ -512,7 +513,8 @@ def benchmark_cluster(manager_instance_id, worker_instance_ids, proxy_instance_i
     for _ in range(1000):
         # Send a read request to proxy for load-balanced reading
         requests.get(f"http://{proxy_instance_id}/read")
-
+'''
+        
 # File with the IDs of the instances
 INSTANCE_FILE = "instance_ids.json"
 
@@ -551,7 +553,7 @@ def main():
     gatekeeper_instance_id, trusted_host_id = setup_gatekeeper(ec2_client, key_name, sg_id, subnet_id, proxy_ip)
 
     # Step 7: Send benchmarking requests
-    benchmark_cluster(manager_instance_id, worker_instance_ids, proxy_instance_id)
+    # benchmark_cluster(manager_instance_id, worker_instance_ids, proxy_instance_id)
 
 if __name__ == "__main__":
     main()
