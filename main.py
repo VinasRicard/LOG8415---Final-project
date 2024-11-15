@@ -183,7 +183,7 @@ def setup_mysql_cluster(ec2_client, key_name, sg_id, subnet_id):
     ami_id = 'ami-0e86e20dae9224db8'
 
     # User Data script to set up MySQL, configure replication, and install Sakila
-    user_data_script = r'''#!/bin/bash
+    user_data_script = '''#!/bin/bash
     # Update and install MySQL
     sudo apt update -y
     sudo apt install -y mysql-server wget
@@ -195,30 +195,48 @@ def setup_mysql_cluster(ec2_client, key_name, sg_id, subnet_id):
     sudo sed -i '/\[mysqld\]/a binlog_format=ROW' /etc/mysql/mysql.conf.d/mysqld.cnf
     sudo systemctl restart mysql
 
+    # Download and load Sakila database on all instances
+    wget https://downloads.mysql.com/docs/sakila-db.tar.gz
+    tar -xvf sakila-db.tar.gz
+    # Ensure files exist before executing
+    if [ -f sakila-db/sakila-schema.sql ]; then
+        echo "Loading schema..."
+        sudo mysql < sakila-db/sakila-schema.sql
+    else
+        echo "Schema file not found."
+    fi
+
+    if [ -f sakila-db/sakila-data.sql ]; then
+        echo "Loading data..."
+        sudo mysql < sakila-db/sakila-data.sql
+    else
+        echo "Data file not found."
+    fi
+
     # Configure MySQL for replication if this is the manager
     if [[ $(hostname) == *"manager"* ]]; then
         # Setup replication user on the manager
         sudo mysql -e "CREATE USER 'repl'@'%' IDENTIFIED BY 'replica_password';"
         sudo mysql -e "GRANT REPLICATION SLAVE ON *.* TO 'repl'@'%';"
         sudo mysql -e "FLUSH PRIVILEGES;"
-        
-        # Get manager's private IP to use for workers' connection
+
+        # Get manager's private IP using EC2 Metadata
         manager_private_ip=$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)
-        echo "Manager IP: $manager_private_ip" > /tmp/manager_ip.txt
+        echo "Manager IP: $manager_private_ip"
     else
         # Configure worker to connect to the manager
-        # Wait for /tmp/manager_ip.txt file to be created
-        while [ ! -f /tmp/manager_ip.txt ]; do sleep 5; done
-        manager_private_ip=$(cat /tmp/manager_ip.txt)
+        # Get manager's IP using EC2 Metadata (assuming manager is already running)
+        manager_private_ip=$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)
+        
+        # Wait until manager is ready to accept connections (you can add a sleep or check)
+        while [ -z "$manager_private_ip" ]; do
+            echo "Waiting for manager IP to be available..."
+            sleep 5
+            manager_private_ip=$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)
+        done
         
         sudo mysql -e "CHANGE MASTER TO MASTER_HOST='$manager_private_ip', MASTER_USER='repl', MASTER_PASSWORD='replica_password', MASTER_AUTO_POSITION=1; START SLAVE;"
     fi
-
-    # Download and load Sakila database on all instances
-    wget https://downloads.mysql.com/docs/sakila-db.tar.gz
-    tar -xvf sakila-db.tar.gz
-    sudo mysql < sakila-db/sakila-schema.sql
-    sudo mysql < sakila-db/sakila-data.sql
     '''
 
     # Define the instance configurations
