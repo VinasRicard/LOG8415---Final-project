@@ -3,11 +3,12 @@ import sys, os, time
 import json
 from botocore.exceptions import ClientError
 import paramiko
-import boto3
 import time
 import random
 import subprocess
 import requests
+import time
+import botocore.exceptions
 
 # Initialize clients
 ec2_client = boto3.client('ec2', region_name='us-east-1')
@@ -261,118 +262,243 @@ def setup_mysql_cluster(ec2_client, key_name, sg_id, subnet_id):
 
 # Set up the proxy
 # NEEDS TO BE REDONE!!!!!
-def setup_proxy(ec2_client, key_name, sg_id, subnet_id, manager_instance_id, worker_instance_ids):
+# Configuración del proxy
+def setup_proxy(ec2_client, key_name, sg_id, subnet_id, manager_ip, worker_ips):
+    user_data_script_proxy = f'''#!/bin/bash
+    sudo apt update -y
+    sudo apt install -y python3-pip
+    pip3 install fastapi uvicorn requests
+    cat << EOF > /home/ubuntu/proxy_app.py
+    from fastapi import FastAPI
+    import requests
+    import random
+    import subprocess
+
+    app = FastAPI()
+
+    manager_ip = "{manager_ip}"
+    worker_ips = {worker_ips}
+
+    @app.post("/write")
+    def write():
+        response = requests.post(f"http://{{manager_ip}}/write")
+        return {{"status": response.status_code, "message": "Request forwarded to manager"}}
+
+    @app.get("/read")
+    def read():
+        worker_ip = random.choice(worker_ips)
+        response = requests.get(f"http://{{worker_ip}}/read")
+        return {{"status": response.status_code, "message": f"Request forwarded to worker {{worker_ip}}" }}
+
+    @app.get("/ping-read")
+    def ping_read():
+        ping_times = {{}}
+        for worker_ip in worker_ips:
+            ping_time = subprocess.check_output(["ping", "-c", "1", worker_ip]).decode().split("time=")[-1].split(" ")[0]
+            ping_times[worker_ip] = float(ping_time)
+        fastest_worker = min(ping_times, key=ping_times.get)
+        response = requests.get(f"http://{{fastest_worker}}/read")
+        return {{"status": response.status_code, "message": f"Request forwarded to fastest worker {{fastest_worker}}" }}
+
+    EOF
+        nohup uvicorn /home/ubuntu/proxy_app:app --host 0.0.0.0 --port 80 --log-level info &
+        '''
+    ami_id = 'ami-0e86e20dae9224db8'
+
+    proxy_instance = ec2_client.run_instances(
+        InstanceType='t2.large',
+        ImageId=ami_id,
+        KeyName=key_name,
+        SecurityGroupIds=[sg_id],
+        SubnetId=subnet_id,
+        MinCount=1,
+        MaxCount=1,
+        TagSpecifications=[{
+            'ResourceType': 'instance',
+            'Tags': [{'Key': 'Name', 'Value': 'proxy'}]
+        }],
+        UserData=user_data_script_proxy
+    )
+    proxy_instance_id = proxy_instance['Instances'][0]['InstanceId']
+    print(f"Proxy instance created with ID: {proxy_instance_id}")
+
+    return proxy_instance_id
+
+def get_public_ip(instance_id):
+    retries = 3
+    for i in range(retries):
+        try:
+            instance_description = ec2_client.describe_instances(InstanceIds=[instance_id])
+            public_ip = instance_description['Reservations'][0]['Instances'][0].get('PublicIpAddress')
+            return public_ip
+        except botocore.exceptions.ClientError as e:
+            if e.response['Error']['Code'] == 'InvalidInstanceID.NotFound':
+                print(f"Instance {instance_id} not found. Retrying in 30 seconds...")
+                time.sleep(30)
+            else:
+                raise e
+    raise Exception(f"Unable to retrieve public IP for instance {instance_id} after {retries} retries.")
+
+# Set up the gatekeeper
+def setup_gatekeeper(ec2_client, key_name, sg_id, subnet_id, proxy_ip):
     """
-    Set up the proxy with load balancing configurations.
+    Deploy the Gatekeeper and Trusted Host instances and configure them with FastAPI to securely handle requests.
     Args:
         ec2_client: The boto3 EC2 client.
         key_name: Key pair name to SSH into the instance.
         sg_id: Security group ID.
         subnet_id: Subnet ID.
-        manager_instance_id: The instance ID of the manager.
-        worker_instance_ids: A list of instance IDs for the worker nodes.
+        proxy_ip: Public IP of the Proxy instance to which Trusted Host will forward requests.
     Returns:
-        Proxy instance ID.
+        Tuple with Gatekeeper and Trusted Host instance IDs.
     """
+    # Script to configure the Trusted Host with FastAPI to handle requests from Gatekeeper
+    user_data_script_trusted_host = f'''#!/bin/bash
+    sudo apt update -y
+    sudo apt install -y python3-pip
+    pip3 install fastapi uvicorn requests
+    cat << EOF > /home/ubuntu/trusted_host_app.py
+    from fastapi import FastAPI, Request
+    import requests
 
-    # Simulated endpoint for testing
-    manager_ip = get_public_ip(manager_instance_id)
-    worker_ips = [get_public_ip(worker_id) for worker_id in worker_instance_ids]
+    app = FastAPI()
 
-    # Define the routing strategies
-    def direct_hit(endpoint="write"):
-        """
-        Direct all requests to the manager instance.
-        """
-        print(f"Direct hit to manager instance at {manager_ip} for endpoint: {endpoint}")
-        response = requests.post(f"http://{manager_ip}/{endpoint}")
-        return response.status_code
+    # IP del Proxy para reenviar las solicitudes desde el Trusted Host
+    proxy_ip = "{proxy_ip}"
 
-    def random_worker(endpoint="read"):
-        """
-        Randomly choose a worker node to handle a read request.
-        """
-        worker_ip = random.choice(worker_ips)
-        print(f"Random worker selected: {worker_ip} for endpoint: {endpoint}")
-        response = requests.get(f"http://{worker_ip}/{endpoint}")
-        return response.status_code
+    @app.post("/write")
+    async def write(request: Request):
+        data = await request.json()
+        response = requests.post(f"http://{{proxy_ip}}/write", json=data)
+        response2 = f"The status is: { {'status': 200, 'message': 'Request forwarded to proxy for write operation'} }"
+        return response2
 
-    def ping_based(endpoint="read"):
-        """
-        Route to the worker with the lowest ping time.
-        """
-        ping_times = {}
-        for worker_ip in worker_ips:
-            ping_time = subprocess.check_output(["ping", "-c", "1", worker_ip])
-            ping_times[worker_ip] = float(ping_time.decode().split("time=")[-1].split(" ")[0])
-        fastest_worker = min(ping_times, key=ping_times.get)
-        print(f"Fastest worker selected: {fastest_worker} with ping {ping_times[fastest_worker]} ms for endpoint: {endpoint}")
-        response = requests.get(f"http://{fastest_worker}/{endpoint}")
-        return response.status_code
 
-    # Example usage of the routing logic
-    routing_method = "random"  # Adjust this as needed for different strategies
 
-    if routing_method == "direct":
-        direct_hit("write")
-    elif routing_method == "random":
-        random_worker("read")
-    elif routing_method == "ping":
-        ping_based("read")
+    @app.get("/read")
+    async def read():
+        response = requests.get(f"http://{{proxy_ip}}/read")
+        response2 = f"The status is: { {'status': 200, 'message': 'Request forwarded to proxy for write operation'} }"
+        return response2
 
-def get_public_ip(instance_id):
-    """
-    Retrieves the public IP address of an instance.
-    Args:
-        instance_id: The instance ID.
-    Returns:
-        The public IP address as a string.
-    """
-    instance_description = ec2_client.describe_instances(InstanceIds=[instance_id])
-    return instance_description['Reservations'][0]['Instances'][0]['PublicIpAddress']
+    @app.get("/ping-read")
+    async def ping_read():
+        response = requests.get(f"http://{{proxy_ip}}/ping-read")
+        response2 = f"The status is: { {'status': 200, 'message': 'Request forwarded to proxy for write operation'} }"
+        return response2
 
-# Set up the gatekeeper
-# NEEDS TO BE REDONE!!!!!!
-def setup_gatekeeper(ec2_client, key_name, sg_id, subnet_id, proxy_instance_id):
-    """
-    Deploy the Gatekeeper instance and Trusted Host instance.
-    """
-    # Create Gatekeeper instance
-    gatekeeper_instance = ec2_client.run_instances(
-        InstanceType='t2.large',
-        KeyName=key_name,
-        SecurityGroupIds=[sg_id],
-        SubnetId=subnet_id,
-        MinCount=1,
-        MaxCount=1,
-    )
-    gatekeeper_instance_id = gatekeeper_instance['Instances'][0]['InstanceId']
-    print(f"Gatekeeper instance created with ID: {gatekeeper_instance_id}")
+    EOF
 
-    # Create Trusted Host instance
+        nohup uvicorn /home/ubuntu/trusted_host_app:app --host 0.0.0.0 --port 80 &
+        '''
+
+    # Launch the Trusted Host instance
+    ami_id = 'ami-0e86e20dae9224db8'
+
     trusted_host_instance = ec2_client.run_instances(
         InstanceType='t2.large',
         KeyName=key_name,
+        ImageId=ami_id,
         SecurityGroupIds=[sg_id],
         SubnetId=subnet_id,
         MinCount=1,
         MaxCount=1,
+        TagSpecifications=[{
+            'ResourceType': 'instance',
+            'Tags': [{'Key': 'Name', 'Value': 'trusted_host'}]
+        }],
+        UserData=user_data_script_trusted_host
     )
-    trusted_host_id = trusted_host_instance['Instances'][0]['InstanceId']
-    print(f"Trusted Host instance created with ID: {trusted_host_id}")
+    trusted_host_instance_id = trusted_host_instance['Instances'][0]['InstanceId']
+    ec2_client.get_waiter('instance_running').wait(InstanceIds=[trusted_host_instance_id])
+    trusted_host_ip = get_public_ip(trusted_host_instance_id)
+    print(f"Trusted Host instance created with ID: {trusted_host_instance_id} and IP: {trusted_host_ip}")
 
-    # Security configuration to only allow Gatekeeper to communicate with Trusted Host
-    configure_gatekeeper_security(ec2_client, gatekeeper_instance_id, trusted_host_id)
+    # Script to configure the Gatekeeper with FastAPI to validate requests and forward to Trusted Host
+    user_data_script_gatekeeper = f'''#!/bin/bash
+    sudo apt update -y
+    sudo apt install -y python3-pip
+    pip3 install fastapi uvicorn requests
+    cat << EOF > /home/ubuntu/gatekeeper_app.py
+    from fastapi import FastAPI, Request
+    import requests
 
-    return gatekeeper_instance_id, trusted_host_id
+    app = FastAPI()
+
+    # IP del Trusted Host para reenviar las solicitudes desde el Gatekeeper
+    trusted_host_ip = "{trusted_host_ip}"
+
+    @app.post("/write")
+    async def write(request: Request):
+        data = await request.json()
+        response = requests.post(f"http://{{trusted_host_ip}}/write", json=data)
+        response2 = f"The status is: { {'status': 200, 'message': 'Request forwarded to proxy for write operation'} }"
+        return response2
+
+    @app.get("/read")
+    async def read():
+        response = requests.get(f"http://{{trusted_host_ip}}/read")
+        response2 = f"The status is: { {'status': 200, 'message': 'Request forwarded to proxy for write operation'} }"
+        return response2
+
+    @app.get("/ping-read")
+    async def ping_read():
+        response = requests.get(f"http://{{trusted_host_ip}}/ping-read")
+        response2 = f"The status is: { {'status': 200, 'message': 'Request forwarded to proxy for write operation'} }"
+        return response2
+
+    EOF
+
+    nohup uvicorn /home/ubuntu/gatekeeper_app:app --host 0.0.0.0 --port 80 &
+    '''
+
+    # Launch the Gatekeeper instance
+    ami_id = 'ami-0e86e20dae9224db8'
+
+    gatekeeper_instance = ec2_client.run_instances(
+        InstanceType='t2.large',
+        KeyName=key_name,
+        ImageId=ami_id,
+        SecurityGroupIds=[sg_id],
+        SubnetId=subnet_id,
+        MinCount=1,
+        MaxCount=1,
+        TagSpecifications=[{
+            'ResourceType': 'instance',
+            'Tags': [{'Key': 'Name', 'Value': 'gatekeeper'}]
+        }],
+        UserData=user_data_script_gatekeeper
+    )
+    gatekeeper_instance_id = gatekeeper_instance['Instances'][0]['InstanceId']
+    ec2_client.get_waiter('instance_running').wait(InstanceIds=[gatekeeper_instance_id])
+    gatekeeper_ip = get_public_ip(gatekeeper_instance_id)
+    print(f"Gatekeeper instance created with ID: {gatekeeper_instance_id} and IP: {gatekeeper_ip}")
+
+    # Security configuration to ensure only Gatekeeper can communicate with Trusted Host
+    configure_gatekeeper_security(ec2_client, sg_id, trusted_host_ip)
+
+    return gatekeeper_instance_id, trusted_host_instance_id
 
 # Configure the gatekeeper security
-def configure_gatekeeper_security(ec2_client, gatekeeper_instance_id, trusted_host_id):
-    """
-    Configures security settings for Gatekeeper pattern.
-    """
-    # Security rules to ensure Gatekeeper can communicate with Trusted Host only
-    pass
+def configure_gatekeeper_security(ec2_client, sg_id, trusted_host_ip):
+    '''
+    ec2_client.authorize_security_group_ingress(
+        GroupId=sg_id,
+        IpPermissions=[
+            {
+                'IpProtocol': 'tcp',  # Example: Allowing TCP protocol
+                'FromPort': 22,       # Example: Allowing SSH (port 22)
+                'ToPort': 22,         # Example: Allowing SSH (port 22)
+                'IpRanges': [
+                    {
+                        'CidrIp': trusted_host_ip,  # Use trusted_host_ip here
+                        'Description': 'SSH access from trusted host'
+                    }
+                ]
+            }
+        ]
+    )
+    '''
 
 # Benchmarking
 def benchmark_cluster(manager_instance_id, worker_instance_ids, proxy_instance_id):
@@ -416,10 +542,13 @@ def main():
     save_instance_ids(manager_instance_id, worker_instance_ids)
 
     # Step 5: Set up the proxy instance and configure load balancing
-    proxy_instance_id = setup_proxy(ec2_client, key_name, sg_id, subnet_id, manager_instance_id, worker_instance_ids)
+    manager_ip = get_public_ip(manager_instance_id)
+    worker_ips = [get_public_ip(worker_id) for worker_id in worker_instance_ids]
+    proxy_instance_id = setup_proxy(ec2_client, key_name, sg_id, subnet_id, manager_ip, worker_ips)
 
     # Step 6: Set up the gatekeeper pattern
-    gatekeeper_instance_id, trusted_host_id = setup_gatekeeper(ec2_client, key_name, sg_id, subnet_id, proxy_instance_id)
+    proxy_ip = get_public_ip(proxy_instance_id)
+    gatekeeper_instance_id, trusted_host_id = setup_gatekeeper(ec2_client, key_name, sg_id, subnet_id, proxy_ip)
 
     # Step 7: Send benchmarking requests
     benchmark_cluster(manager_instance_id, worker_instance_ids, proxy_instance_id)
