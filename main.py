@@ -178,158 +178,92 @@ def get_subnet(ec2_client, vpc_id):
         sys.exit(1)
 
 # Set up the mysql clusters
-def setup_mysql_cluster2(ec2_client, key_name, sg_id, subnet_id):
-    instance_type = 't2.micro'
-    ami_id = 'ami-0e86e20dae9224db8'
-
-    # User Data script to set up MySQL, configure replication, and install Sakila
-    user_data_script = '''#!/bin/bash
-    # Update and install MySQL
-    sudo apt update -y
-    sudo apt install -y mysql-server wget
-
-    # Enable GTID-based replication for MySQL
-    sudo sed -i '/\[mysqld\]/a gtid_mode=ON' /etc/mysql/mysql.conf.d/mysqld.cnf
-    sudo sed -i '/\[mysqld\]/a enforce_gtid_consistency=ON' /etc/mysql/mysql.conf.d/mysqld.cnf
-    sudo sed -i '/\[mysqld\]/a log_slave_updates=ON' /etc/mysql/mysql.conf.d/mysqld.cnf
-    sudo sed -i '/\[mysqld\]/a binlog_format=ROW' /etc/mysql/mysql.conf.d/mysqld.cnf
-    sudo systemctl restart mysql
-
-    # Download and load Sakila database on all instances
-    wget https://downloads.mysql.com/docs/sakila-db.tar.gz
-    tar -xvf sakila-db.tar.gz
-    # Ensure files exist before executing
-    if [ -f sakila-db/sakila-schema.sql ]; then
-        echo "Loading schema..."
-        sudo mysql < sakila-db/sakila-schema.sql
-    else
-        echo "Schema file not found."
-    fi
-
-    if [ -f sakila-db/sakila-data.sql ]; then
-        echo "Loading data..."
-        sudo mysql < sakila-db/sakila-data.sql
-    else
-        echo "Data file not found."
-    fi
-
-    # Configure MySQL for replication if this is the manager
-    if [[ $(hostname) == *"manager"* ]]; then
-        # Setup replication user on the manager
-        sudo mysql -e "CREATE USER 'repl'@'%' IDENTIFIED BY 'replica_password';"
-        sudo mysql -e "GRANT REPLICATION SLAVE ON *.* TO 'repl'@'%';"
-        sudo mysql -e "FLUSH PRIVILEGES;"
-
-        # Get manager's private IP using EC2 Metadata
-        manager_private_ip=$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)
-        echo "Manager IP: $manager_private_ip"
-    else
-        # Configure worker to connect to the manager
-        # Get manager's IP using EC2 Metadata (assuming manager is already running)
-        manager_private_ip=$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)
-        
-        # Wait until manager is ready to accept connections (you can add a sleep or check)
-        while [ -z "$manager_private_ip" ]; do
-            echo "Waiting for manager IP to be available..."
-            sleep 5
-            manager_private_ip=$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)
-        done
-        
-        sudo mysql -e "CHANGE MASTER TO MASTER_HOST='$manager_private_ip', MASTER_USER='repl', MASTER_PASSWORD='replica_password', MASTER_AUTO_POSITION=1; START SLAVE;"
-    fi
-    '''
-
-    # Define the instance configurations
-    instances_config = [
-        {'Name': 'manager', 'Role': 'manager'},
-        {'Name': 'worker-1', 'Role': 'worker'},
-        {'Name': 'worker-2', 'Role': 'worker'}
-    ]
-
-    instance_ids = []
-    for config in instances_config:
-        # Launch each instance with user_data script
-        instance = ec2_client.run_instances(
-            ImageId=ami_id,
-            InstanceType=instance_type,
-            KeyName=key_name,
-            SecurityGroupIds=[sg_id],
-            SubnetId=subnet_id,
-            MinCount=1,
-            MaxCount=1,
-            TagSpecifications=[{
-                'ResourceType': 'instance',
-                'Tags': [
-                    {'Key': 'Name', 'Value': config['Name']}
-                ]
-            }],
-            UserData=user_data_script  # Pass the user_data script here
-        )
-        instance_ids.append(instance['Instances'][0]['InstanceId'])
-        print(f"{config['Name'].capitalize()} instance created with ID: {instance['Instances'][0]['InstanceId']}")
-
-    # Wait for instances to be in running state
-    print("Waiting for instances to be in running state...")
-    ec2_client.get_waiter('instance_running').wait(InstanceIds=instance_ids)
-
-    # Fetch and print public IPs for manager and workers
-    manager_instance_id = instance_ids[0]
-    worker_instance_ids = instance_ids[1:]
-
-    return manager_instance_id, worker_instance_ids
-
 def setup_manager(ec2_client, key_name, sg_id, subnet_id):
     instance_type = 't2.micro'
     ami_id = 'ami-0e86e20dae9224db8'
 
-    # User Data script to set up MySQL and configure replication for manager
+    # User Data script to set up MySQL, FastAPI and configure replication for manager
     user_data_script = '''#!/bin/bash
-    # Update and install MySQL
+    # Actualiza el sistema e instala dependencias
     sudo apt update -y
-    sudo apt install -y mysql-server wget
+    sudo apt install -y mysql-server wget python3-pip python3-venv
 
-    # Set the server-id for the manager (should be unique, e.g., 1)
+    # Crea un entorno virtual para las dependencias de Python
+    python3 -m venv /home/ubuntu/myenv
+    source /home/ubuntu/myenv/bin/activate
+
+    # Instala FastAPI, Uvicorn y el conector de MySQL en el entorno virtual
+    pip install fastapi uvicorn mysql-connector-python
+
+    # Configuración de MySQL
     sudo sed -i '/\[mysqld\]/a server-id=1' /etc/mysql/mysql.conf.d/mysqld.cnf
-
-    # Enable GTID-based replication for MySQL
     sudo sed -i '/\[mysqld\]/a gtid_mode=ON' /etc/mysql/mysql.conf.d/mysqld.cnf
     sudo sed -i '/\[mysqld\]/a enforce_gtid_consistency=ON' /etc/mysql/mysql.conf.d/mysqld.cnf
     sudo sed -i '/\[mysqld\]/a log_slave_updates=ON' /etc/mysql/mysql.conf.d/mysqld.cnf
     sudo sed -i '/\[mysqld\]/a binlog_format=ROW' /etc/mysql/mysql.conf.d/mysqld.cnf
-    sudo systemctl restart mysql
-
-    # Change bind-address to allow external connections (0.0.0.0)
     sudo sed -i 's/^bind-address\s*=.*$/bind-address = 0.0.0.0/' /etc/mysql/mysql.conf.d/mysqld.cnf
-
-    # Enable MySQL to listen on all interfaces
     sudo systemctl restart mysql
 
-    # Download and load Sakila database on the manager
+    # Carga la base de datos Sakila
     wget https://downloads.mysql.com/docs/sakila-db.tar.gz
     tar -xvf sakila-db.tar.gz
-    if [ -f sakila-db/sakila-schema.sql ]; then
-        echo "Loading schema..."
-        sudo mysql < sakila-db/sakila-schema.sql
-    else
-        echo "Schema file not found."
-    fi
+    sudo mysql < sakila-db/sakila-schema.sql
+    sudo mysql < sakila-db/sakila-data.sql
 
-    if [ -f sakila-db/sakila-data.sql ]; then
-        echo "Loading data..."
-        sudo mysql < sakila-db/sakila-data.sql
-    else
-        echo "Data file not found."
-    fi
-
-    # Setup replication user for manager
+    # Configura el usuario de replicación
     sudo mysql -e "CREATE USER 'repl'@'%' IDENTIFIED BY 'replica_password';"
     sudo mysql -e "GRANT REPLICATION SLAVE ON *.* TO 'repl'@'%';"
+    sudo mysql -e "ALTER USER 'repl'@'%' IDENTIFIED WITH mysql_native_password BY 'replica_password';"
     sudo mysql -e "FLUSH PRIVILEGES;"
 
-    # Change replication user 'repl' to use mysql_native_password
+    # Crea el archivo de la aplicación FastAPI
+    cat <<EOF > /home/ubuntu/app.py
+from fastapi import FastAPI
+import mysql.connector
+from pydantic import BaseModel
+
+app = FastAPI()
+
+class Item(BaseModel):
+    column1: str
+    column2: str
+
+def get_db_connection():
+    conn = mysql.connector.connect(
+        host="localhost", 
+        user="api_user",  # Usando el usuario 'api_user'
+        password="api_password",  # Contraseña para 'api_user'
+        database="sakila"
+    )
+    return conn
+
+@app.post("/insert_item/")
+async def insert_item(item: Item):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    query = "INSERT INTO actor (first_name, last_name) VALUES (%s, %s)"
+    cursor.execute(query, (item.column1, item.column2))
+    conn.commit()
+    cursor.close()
+    conn.close()
+    return {"message": "Item inserted successfully"}
+EOF
+
+    source /home/ubuntu/myenv/bin/activate
+
+    # Cambia los permisos del archivo para garantizar su ejecución
+    chown ubuntu:ubuntu /home/ubuntu/app.py
+
+    # Ejecuta la aplicación FastAPI con Uvicorn en el entorno virtual
+    nohup /home/ubuntu/myenv/bin/uvicorn app:app --host 0.0.0.0 --port 8000 --reload &
+
+    # Configura el usuario de replicación
+    sudo mysql -e "CREATE USER 'repl'@'%' IDENTIFIED BY 'replica_password';"
+    sudo mysql -e "GRANT REPLICATION SLAVE ON *.* TO 'repl'@'%';"
     sudo mysql -e "ALTER USER 'repl'@'%' IDENTIFIED WITH mysql_native_password BY 'replica_password';"
     sudo mysql -e "FLUSH PRIVILEGES;"
     '''
+
 
     # Launch the manager instance
     instance = ec2_client.run_instances(
@@ -362,6 +296,8 @@ def setup_manager(ec2_client, key_name, sg_id, subnet_id):
     print(f"Manager's private IP: {manager_private_ip}")
 
     return manager_instance_id, manager_private_ip
+
+
 
 def setup_worker(ec2_client, key_name, sg_id, subnet_id, manager_private_ip, worker_name, server_id):
     instance_type = 't2.micro'
@@ -445,8 +381,6 @@ def setup_mysql_cluster(ec2_client, key_name, sg_id, subnet_id):
     return manager_instance_id, worker_instance_ids
 
 # Set up the proxy
-# NEEDS TO BE REDONE!!!!!
-# Configuración del proxy
 def setup_proxy(ec2_client, key_name, sg_id, subnet_id, manager_ip, worker_ips):
     user_data_script_proxy = f'''#!/bin/bash
     sudo apt update -y
