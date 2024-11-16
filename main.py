@@ -178,7 +178,7 @@ def get_subnet(ec2_client, vpc_id):
         sys.exit(1)
 
 # Set up the mysql clusters
-def setup_mysql_cluster(ec2_client, key_name, sg_id, subnet_id):
+def setup_mysql_cluster2(ec2_client, key_name, sg_id, subnet_id):
     instance_type = 't2.micro'
     ami_id = 'ami-0e86e20dae9224db8'
 
@@ -275,6 +275,172 @@ def setup_mysql_cluster(ec2_client, key_name, sg_id, subnet_id):
     # Fetch and print public IPs for manager and workers
     manager_instance_id = instance_ids[0]
     worker_instance_ids = instance_ids[1:]
+
+    return manager_instance_id, worker_instance_ids
+
+def setup_manager(ec2_client, key_name, sg_id, subnet_id):
+    instance_type = 't2.micro'
+    ami_id = 'ami-0e86e20dae9224db8'
+
+    # User Data script to set up MySQL and configure replication for manager
+    user_data_script = '''#!/bin/bash
+    # Update and install MySQL
+    sudo apt update -y
+    sudo apt install -y mysql-server wget
+
+    # Set the server-id for the manager (should be unique, e.g., 1)
+    sudo sed -i '/\[mysqld\]/a server-id=1' /etc/mysql/mysql.conf.d/mysqld.cnf
+
+    # Enable GTID-based replication for MySQL
+    sudo sed -i '/\[mysqld\]/a gtid_mode=ON' /etc/mysql/mysql.conf.d/mysqld.cnf
+    sudo sed -i '/\[mysqld\]/a enforce_gtid_consistency=ON' /etc/mysql/mysql.conf.d/mysqld.cnf
+    sudo sed -i '/\[mysqld\]/a log_slave_updates=ON' /etc/mysql/mysql.conf.d/mysqld.cnf
+    sudo sed -i '/\[mysqld\]/a binlog_format=ROW' /etc/mysql/mysql.conf.d/mysqld.cnf
+    sudo systemctl restart mysql
+
+    # Change bind-address to allow external connections (0.0.0.0)
+    sudo sed -i 's/^bind-address\s*=.*$/bind-address = 0.0.0.0/' /etc/mysql/mysql.conf.d/mysqld.cnf
+
+    # Enable MySQL to listen on all interfaces
+    sudo systemctl restart mysql
+
+    # Download and load Sakila database on the manager
+    wget https://downloads.mysql.com/docs/sakila-db.tar.gz
+    tar -xvf sakila-db.tar.gz
+    if [ -f sakila-db/sakila-schema.sql ]; then
+        echo "Loading schema..."
+        sudo mysql < sakila-db/sakila-schema.sql
+    else
+        echo "Schema file not found."
+    fi
+
+    if [ -f sakila-db/sakila-data.sql ]; then
+        echo "Loading data..."
+        sudo mysql < sakila-db/sakila-data.sql
+    else
+        echo "Data file not found."
+    fi
+
+    # Setup replication user for manager
+    sudo mysql -e "CREATE USER 'repl'@'%' IDENTIFIED BY 'replica_password';"
+    sudo mysql -e "GRANT REPLICATION SLAVE ON *.* TO 'repl'@'%';"
+    sudo mysql -e "FLUSH PRIVILEGES;"
+
+    # Change replication user 'repl' to use mysql_native_password
+    sudo mysql -e "ALTER USER 'repl'@'%' IDENTIFIED WITH mysql_native_password BY 'replica_password';"
+    sudo mysql -e "FLUSH PRIVILEGES;"
+    '''
+
+    # Launch the manager instance
+    instance = ec2_client.run_instances(
+        ImageId=ami_id,
+        InstanceType=instance_type,
+        KeyName=key_name,
+        SecurityGroupIds=[sg_id],
+        SubnetId=subnet_id,
+        MinCount=1,
+        MaxCount=1,
+        TagSpecifications=[{
+            'ResourceType': 'instance',
+            'Tags': [
+                {'Key': 'Name', 'Value': 'manager'}
+            ]
+        }],
+        UserData=user_data_script  # Pass the user_data script for manager
+    )
+
+    # Get the instance ID and private IP of the manager
+    manager_instance_id = instance['Instances'][0]['InstanceId']
+    print(f"Manager instance created with ID: {manager_instance_id}")
+
+    # Wait for the instance to be in running state
+    print("Waiting for manager instance to be in running state...")
+    ec2_client.get_waiter('instance_running').wait(InstanceIds=[manager_instance_id])
+
+    # Fetch private IP of the manager
+    manager_private_ip = ec2_client.describe_instances(InstanceIds=[manager_instance_id])['Reservations'][0]['Instances'][0]['PrivateIpAddress']
+    print(f"Manager's private IP: {manager_private_ip}")
+
+    return manager_instance_id, manager_private_ip
+
+def setup_worker(ec2_client, key_name, sg_id, subnet_id, manager_private_ip, worker_name, server_id):
+    instance_type = 't2.micro'
+    ami_id = 'ami-0e86e20dae9224db8'
+
+    # User Data script to set up MySQL and configure replication for workers
+    user_data_script = f'''#!/bin/bash
+    # Update and install MySQL
+    sudo apt update -y
+    sudo apt install -y mysql-server wget
+
+    # Set the server-id for the worker (should be unique, e.g., 2 for worker1, 3 for worker2)
+    sudo sed -i '/\[mysqld\]/a server-id={server_id}' /etc/mysql/mysql.conf.d/mysqld.cnf
+
+    # Enable GTID-based replication for MySQL
+    sudo sed -i '/\[mysqld\]/a gtid_mode=ON' /etc/mysql/mysql.conf.d/mysqld.cnf
+    sudo sed -i '/\[mysqld\]/a enforce_gtid_consistency=ON' /etc/mysql/mysql.conf.d/mysqld.cnf
+    sudo sed -i '/\[mysqld\]/a log_slave_updates=ON' /etc/mysql/mysql.conf.d/mysqld.cnf
+    sudo sed -i '/\[mysqld\]/a binlog_format=ROW' /etc/mysql/mysql.conf.d/mysqld.cnf
+    sudo systemctl restart mysql
+
+    # Download and load Sakila database on the worker
+    wget https://downloads.mysql.com/docs/sakila-db.tar.gz
+    tar -xvf sakila-db.tar.gz
+    if [ -f sakila-db/sakila-schema.sql ]; then
+        echo "Loading schema..."
+        sudo mysql < sakila-db/sakila-schema.sql
+    else
+        echo "Schema file not found."
+    fi
+
+    if [ -f sakila-db/sakila-data.sql ]; then
+        echo "Loading data..."
+        sudo mysql < sakila-db/sakila-data.sql
+    else
+        echo "Data file not found."
+    fi
+
+    # Configure the worker to connect to the manager for replication
+    sudo mysql -e "CHANGE MASTER TO MASTER_HOST='{manager_private_ip}', MASTER_USER='repl', MASTER_PASSWORD='replica_password', MASTER_AUTO_POSITION=1; START SLAVE;"
+    '''
+
+    # Launch the worker instances
+    instance = ec2_client.run_instances(
+        ImageId=ami_id,
+        InstanceType=instance_type,
+        KeyName=key_name,
+        SecurityGroupIds=[sg_id],
+        SubnetId=subnet_id,
+        MinCount=1,
+        MaxCount=1,
+        TagSpecifications=[{
+            'ResourceType': 'instance',
+            'Tags': [
+                {'Key': 'Name', 'Value': worker_name}
+            ]
+        }],
+        UserData=user_data_script  # Pass the user_data script for workers
+    )
+
+    # Get the instance ID of the worker
+    worker_instance_id = instance['Instances'][0]['InstanceId']
+    print(f"{worker_name} instance created with ID: {worker_instance_id}")
+
+    # Wait for the instance to be in running state
+    print(f"Waiting for {worker_name} instance to be in running state...")
+    ec2_client.get_waiter('instance_running').wait(InstanceIds=[worker_instance_id])
+
+    return worker_instance_id
+
+def setup_mysql_cluster(ec2_client, key_name, sg_id, subnet_id):
+    # Create the manager
+    manager_instance_id, manager_private_ip = setup_manager(ec2_client, key_name, sg_id, subnet_id)
+
+    # Create workers and pass the manager's IP
+    worker_instance_ids = []
+    for i, worker_name in enumerate(['worker1', 'worker2'], start=2):  # Starting server-id from 2 for worker1
+        worker_instance_id = setup_worker(ec2_client, key_name, sg_id, subnet_id, manager_private_ip, worker_name, i)
+        worker_instance_ids.append(worker_instance_id)
 
     return manager_instance_id, worker_instance_ids
 
