@@ -210,10 +210,9 @@ def setup_manager(ec2_client, key_name, sg_id, subnet_id):
     sudo mysql < sakila-db/sakila-schema.sql
     sudo mysql < sakila-db/sakila-data.sql
 
-    # Configura el usuario de replicación
-    sudo mysql -e "CREATE USER 'repl'@'%' IDENTIFIED BY 'replica_password';"
-    sudo mysql -e "GRANT REPLICATION SLAVE ON *.* TO 'repl'@'%';"
-    sudo mysql -e "ALTER USER 'repl'@'%' IDENTIFIED WITH mysql_native_password BY 'replica_password';"
+    # Crea y configura el usuario 'api_user' para conectarse a MySQL
+    sudo mysql -e "CREATE USER 'api_user'@'localhost' IDENTIFIED BY 'api_password';"
+    sudo mysql -e "GRANT ALL PRIVILEGES ON sakila.* TO 'api_user'@'localhost';"
     sudo mysql -e "FLUSH PRIVILEGES;"
 
     # Crea el archivo de la aplicación FastAPI
@@ -256,16 +255,11 @@ EOF
     chmod 755 /home/ubuntu/app.py
 
     # Ejecuta la aplicación FastAPI con Uvicorn en el entorno virtual
-    nohup /home/ubuntu/myenv/bin/uvicorn app:app --host 0.0.0.0 --port 8000 --reload &
+    cd /home/ubuntu && nohup /home/ubuntu/myenv/bin/uvicorn app:app --host 0.0.0.0 --port 8000 --reload &
+    chmod +x /home/ubuntu/app.py
+    pip install fastapi uvicorn mysql-connector-python
+    nohup /home/ubuntu/myenv/bin/uvicorn app:app --host 0.0.0.0 --port 8000 &
 
-    # Configura el usuario de replicación
-    #sudo mysql -e "CREATE USER 'repl'@'%' IDENTIFIED BY 'replica_password';"
-    #sudo mysql -e "GRANT REPLICATION SLAVE ON *.* TO 'repl'@'%';"
-    #sudo mysql -e "ALTER USER 'repl'@'%' IDENTIFIED WITH mysql_native_password BY 'replica_password';"
-    #sudo mysql -e "FLUSH PRIVILEGES;"
-
-    nohup /home/ubuntu/myenv/bin/uvicorn /home/ubuntu/app:app --host 0.0.0.0 --port 8000 --reload &
-    
     '''
 
     # Launch the manager instance
@@ -299,7 +293,6 @@ EOF
     print(f"Manager's private IP: {manager_private_ip}")
 
     return manager_instance_id, manager_private_ip
-
 
 
 def setup_worker(ec2_client, key_name, sg_id, subnet_id, manager_private_ip, worker_name, server_id):
