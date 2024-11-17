@@ -253,17 +253,20 @@ EOF
 
     # Cambia los permisos del archivo para garantizar su ejecución
     chown ubuntu:ubuntu /home/ubuntu/app.py
+    chmod 755 /home/ubuntu/app.py
 
     # Ejecuta la aplicación FastAPI con Uvicorn en el entorno virtual
     nohup /home/ubuntu/myenv/bin/uvicorn app:app --host 0.0.0.0 --port 8000 --reload &
 
     # Configura el usuario de replicación
-    sudo mysql -e "CREATE USER 'repl'@'%' IDENTIFIED BY 'replica_password';"
-    sudo mysql -e "GRANT REPLICATION SLAVE ON *.* TO 'repl'@'%';"
-    sudo mysql -e "ALTER USER 'repl'@'%' IDENTIFIED WITH mysql_native_password BY 'replica_password';"
-    sudo mysql -e "FLUSH PRIVILEGES;"
-    '''
+    #sudo mysql -e "CREATE USER 'repl'@'%' IDENTIFIED BY 'replica_password';"
+    #sudo mysql -e "GRANT REPLICATION SLAVE ON *.* TO 'repl'@'%';"
+    #sudo mysql -e "ALTER USER 'repl'@'%' IDENTIFIED WITH mysql_native_password BY 'replica_password';"
+    #sudo mysql -e "FLUSH PRIVILEGES;"
 
+    nohup /home/ubuntu/myenv/bin/uvicorn /home/ubuntu/app:app --host 0.0.0.0 --port 8000 --reload &
+    
+    '''
 
     # Launch the manager instance
     instance = ec2_client.run_instances(
@@ -387,40 +390,40 @@ def setup_proxy(ec2_client, key_name, sg_id, subnet_id, manager_ip, worker_ips):
     sudo apt install -y python3-pip
     pip3 install fastapi uvicorn requests
     cat << EOF > /home/ubuntu/proxy_app.py
-    from fastapi import FastAPI
-    import requests
-    import random
-    import subprocess
+from fastapi import FastAPI
+import requests
+import random
+import subprocess
 
-    app = FastAPI()
+app = FastAPI()
 
-    manager_ip = "{manager_ip}"
-    worker_ips = {worker_ips}
+manager_ip = "{manager_ip}"
+worker_ips = {worker_ips}
 
-    @app.post("/write")
-    def write():
-        response = requests.post(f"http://{{manager_ip}}/write")
-        return {{"status": response.status_code, "message": "Request forwarded to manager"}}
+@app.post("/write")
+def write():
+    response = requests.post(f"http://{{manager_ip}}/write")
+    return {{"status": response.status_code, "message": "Request forwarded to manager"}}
 
-    @app.get("/read")
-    def read():
-        worker_ip = random.choice(worker_ips)
-        response = requests.get(f"http://{{worker_ip}}/read")
-        return {{"status": response.status_code, "message": f"Request forwarded to worker {{worker_ip}}" }}
+@app.get("/read")
+def read():
+    worker_ip = random.choice(worker_ips)
+    response = requests.get(f"http://{{worker_ip}}/read")
+    return {{"status": response.status_code, "message": f"Request forwarded to worker {{worker_ip}}" }}
 
-    @app.get("/ping-read")
-    def ping_read():
-        ping_times = {{}}
-        for worker_ip in worker_ips:
-            ping_time = subprocess.check_output(["ping", "-c", "1", worker_ip]).decode().split("time=")[-1].split(" ")[0]
-            ping_times[worker_ip] = float(ping_time)
-        fastest_worker = min(ping_times, key=ping_times.get)
-        response = requests.get(f"http://{{fastest_worker}}/read")
-        return {{"status": response.status_code, "message": f"Request forwarded to fastest worker {{fastest_worker}}" }}
+@app.get("/ping-read")
+def ping_read():
+    ping_times = {{}}
+    for worker_ip in worker_ips:
+        ping_time = subprocess.check_output(["ping", "-c", "1", worker_ip]).decode().split("time=")[-1].split(" ")[0]
+        ping_times[worker_ip] = float(ping_time)
+    fastest_worker = min(ping_times, key=ping_times.get)
+    response = requests.get(f"http://{{fastest_worker}}/read")
+    return {{"status": response.status_code, "message": f"Request forwarded to fastest worker {{fastest_worker}}" }}
 
-    EOF
-        nohup uvicorn /home/ubuntu/proxy_app:app --host 0.0.0.0 --port 80 --log-level info &
-        '''
+EOF
+    nohup uvicorn /home/ubuntu/proxy_app:app --host 0.0.0.0 --port 80 --log-level info &
+    '''
     ami_id = 'ami-0e86e20dae9224db8'
 
     proxy_instance = ec2_client.run_instances(
