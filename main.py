@@ -386,13 +386,16 @@ async def get_item(item_id: int):
 
 EOF
 
-    # Change permissions for the app script
+    source /home/ubuntu/myenv/bin/activate
+
     chown ubuntu:ubuntu /home/ubuntu/app.py
     chmod 755 /home/ubuntu/app.py
 
-    # Start the FastAPI app with Uvicorn
-    source /home/ubuntu/myenv/bin/activate
-    nohup /home/ubuntu/myenv/bin/uvicorn app:app --host 0.0.0.0 --port 8000 --reload &
+    # Ejecuta la aplicación FastAPI con Uvicorn en el entorno virtual
+    cd /home/ubuntu && nohup /home/ubuntu/myenv/bin/uvicorn app:app --host 0.0.0.0 --port 8000 --reload &
+    chmod +x /home/ubuntu/app.py
+    pip install fastapi uvicorn mysql-connector-python
+    nohup /home/ubuntu/myenv/bin/uvicorn app:app --host 0.0.0.0 --port 8000 &
 
     '''
 
