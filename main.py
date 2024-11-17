@@ -215,6 +215,15 @@ def setup_manager(ec2_client, key_name, sg_id, subnet_id):
     sudo mysql -e "GRANT ALL PRIVILEGES ON sakila.* TO 'api_user'@'localhost';"
     sudo mysql -e "FLUSH PRIVILEGES;"
 
+    # Setup replication user for manager
+    sudo mysql -e "CREATE USER 'repl'@'%' IDENTIFIED BY 'replica_password';"
+    sudo mysql -e "GRANT REPLICATION SLAVE ON *.* TO 'repl'@'%';"
+    sudo mysql -e "FLUSH PRIVILEGES;"
+
+    # Change replication user 'repl' to use mysql_native_password
+    sudo mysql -e "ALTER USER 'repl'@'%' IDENTIFIED WITH mysql_native_password BY 'replica_password';"
+    sudo mysql -e "FLUSH PRIVILEGES;"
+
     # Crea el archivo de la aplicación FastAPI
     cat <<EOF > /home/ubuntu/app.py
 from fastapi import FastAPI
@@ -259,7 +268,6 @@ EOF
     chmod +x /home/ubuntu/app.py
     pip install fastapi uvicorn mysql-connector-python
     nohup /home/ubuntu/myenv/bin/uvicorn app:app --host 0.0.0.0 --port 8000 &
-
     '''
 
     # Launch the manager instance
@@ -299,11 +307,11 @@ def setup_worker(ec2_client, key_name, sg_id, subnet_id, manager_private_ip, wor
     instance_type = 't2.micro'
     ami_id = 'ami-0e86e20dae9224db8'
 
-    # User Data script to set up MySQL and configure replication for workers
+    # User Data script to set up MySQL, FastAPI, and configure replication for workers
     user_data_script = f'''#!/bin/bash
-    # Update and install MySQL
+    # Update and install MySQL, Python, and dependencies
     sudo apt update -y
-    sudo apt install -y mysql-server wget
+    sudo apt install -y mysql-server wget python3-pip python3-venv
 
     # Set the server-id for the worker (should be unique, e.g., 2 for worker1, 3 for worker2)
     sudo sed -i '/\[mysqld\]/a server-id={server_id}' /etc/mysql/mysql.conf.d/mysqld.cnf
@@ -334,9 +342,61 @@ def setup_worker(ec2_client, key_name, sg_id, subnet_id, manager_private_ip, wor
 
     # Configure the worker to connect to the manager for replication
     sudo mysql -e "CHANGE MASTER TO MASTER_HOST='{manager_private_ip}', MASTER_USER='repl', MASTER_PASSWORD='replica_password', MASTER_AUTO_POSITION=1; START SLAVE;"
+
+    # Create a Python virtual environment and install FastAPI
+    python3 -m venv /home/ubuntu/myenv
+    source /home/ubuntu/myenv/bin/activate
+
+    pip install fastapi uvicorn mysql-connector-python
+
+    # Create the FastAPI app to handle read requests
+    cat <<EOF > /home/ubuntu/app.py
+from fastapi import FastAPI
+import mysql.connector
+from pydantic import BaseModel
+
+app = FastAPI()
+
+class Item(BaseModel):
+    column1: str
+    column2: str
+
+def get_db_connection():
+    conn = mysql.connector.connect(
+        host="localhost", 
+        user="api_user",  # Using the same user for read access
+        password="api_password",  # Same password for 'api_user'
+        database="sakila"
+    )
+    return conn
+
+@app.get("/get_item/")
+async def get_item(item_id: int):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    query = "SELECT first_name, last_name FROM actor WHERE actor_id = %s"
+    cursor.execute(query, (item_id,))
+    result = cursor.fetchone()
+    cursor.close()
+    conn.close()
+    if result:
+        return result;
+    else:
+        return {{"status": 200, "message": "Error"}}
+
+EOF
+
+    # Change permissions for the app script
+    chown ubuntu:ubuntu /home/ubuntu/app.py
+    chmod 755 /home/ubuntu/app.py
+
+    # Start the FastAPI app with Uvicorn
+    source /home/ubuntu/myenv/bin/activate
+    nohup /home/ubuntu/myenv/bin/uvicorn app:app --host 0.0.0.0 --port 8000 --reload &
+
     '''
 
-    # Launch the worker instances
+    # Launch the worker instance
     instance = ec2_client.run_instances(
         ImageId=ami_id,
         InstanceType=instance_type,
@@ -361,6 +421,10 @@ def setup_worker(ec2_client, key_name, sg_id, subnet_id, manager_private_ip, wor
     # Wait for the instance to be in running state
     print(f"Waiting for {worker_name} instance to be in running state...")
     ec2_client.get_waiter('instance_running').wait(InstanceIds=[worker_instance_id])
+
+    # Fetch the private IP of the worker instance
+    worker_private_ip = ec2_client.describe_instances(InstanceIds=[worker_instance_id])['Reservations'][0]['Instances'][0]['PrivateIpAddress']
+    print(f"{worker_name}'s private IP: {worker_private_ip}")
 
     return worker_instance_id
 
