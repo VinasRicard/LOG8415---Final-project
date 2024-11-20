@@ -549,7 +549,6 @@ EOF
 
     return proxy_instance_id
 
-
 def get_public_ip(instance_id):
     retries = 3
     for i in range(retries):
@@ -581,42 +580,79 @@ def setup_gatekeeper(ec2_client, key_name, sg_id, subnet_id, proxy_ip):
     # Script to configure the Trusted Host with FastAPI to handle requests from Gatekeeper
     user_data_script_trusted_host = f'''#!/bin/bash
     sudo apt update -y
-    sudo apt install -y python3-pip
+    sudo apt install -y python3-pip python3.12-venv python3-setuptools
     pip3 install fastapi uvicorn requests
-    cat << EOF > /home/ubuntu/trusted_host_app.py
-    from fastapi import FastAPI, Request
-    import requests
+    cat << EOF > /home/ubuntu/app.py
+from fastapi import FastAPI
+import requests
+import random
+import subprocess
+import logging
+from pydantic import BaseModel
 
-    app = FastAPI()
+logging.basicConfig(
+    level=logging.INFO,  # Set the log level to INFO or DEBUG depending on your needs
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
 
-    # IP del Proxy para reenviar las solicitudes desde el Trusted Host
-    proxy_ip = "{proxy_ip}"
+# Create a logger
+logger = logging.getLogger(__name__)
 
-    @app.post("/write")
-    async def write(request: Request):
-        data = await request.json()
-        response = requests.post(f"http://{{proxy_ip}}/write", json=data)
-        response2 = f"The status is: { {'status': 200, 'message': 'Request forwarded to proxy for write operation'} }"
-        return response2
+app = FastAPI()
 
+# Modelo Item
+class Item(BaseModel):
+    column1: str
+    column2: str
 
+proxy_ip = "{proxy_ip}"
 
-    @app.get("/read")
-    async def read():
-        response = requests.get(f"http://{{proxy_ip}}/read")
-        response2 = f"The status is: { {'status': 200, 'message': 'Request forwarded to proxy for write operation'} }"
-        return response2
+@app.post("/write")
+def write(item: Item):
+    logger.info(f"Received write request with item: {{item}}")
+    response = requests.post(f"http://{proxy_ip}:8000/write", json=item.dict())
+    return response.json()
 
-    @app.get("/ping-read")
-    async def ping_read():
-        response = requests.get(f"http://{{proxy_ip}}/ping-read")
-        response2 = f"The status is: { {'status': 200, 'message': 'Request forwarded to proxy for write operation'} }"
-        return response2
+@app.get("/random-read/")
+def random_read(item_id: int):
+    response = requests.get(f"http://{proxy_ip}:8000/random-read/?item_id={{item_id}}")
+    return response.json()
 
-    EOF
+@app.get("/direct-read/")
+def direct_read(item_id: int):
+    response = requests.get(f"http://{proxy_ip}:8000/direct-read/?item_id={{item_id}}")
+    return response.json()
 
-        nohup uvicorn /home/ubuntu/trusted_host_app:app --host 0.0.0.0 --port 80 &
-        '''
+@app.get("/ping-read/")
+def ping_read(item_id: int):
+    response = requests.get(f"http://{proxy_ip}:8000/ping-read/?item_id={{item_id}}")
+    return response.json()
+
+EOF
+
+    # Update package list
+    sudo apt update
+
+    # Install python3-venv if not installed
+    sudo apt install python3.12-venv
+
+    # Create the virtual environment
+    sudo python3 -m venv /home/ubuntu/myenv
+
+    # Activate the virtual environment
+    source /home/ubuntu/myenv/bin/activate
+
+    # Upgrade pip in the virtual environment
+    sudo /home/ubuntu/myenv/bin/pip install --upgrade pip
+
+    # Install the required Python packages
+    sudo /home/ubuntu/myenv/bin/pip install fastapi uvicorn mysql-connector-python requests
+
+    # Run the FastAPI application
+    cd /home/ubuntu
+    nohup /home/ubuntu/myenv/bin/uvicorn app:app --host 0.0.0.0 --port 8000 --reload &
+    
+    '''
 
     # Launch the Trusted Host instance
     ami_id = 'ami-0e86e20dae9224db8'
@@ -643,39 +679,78 @@ def setup_gatekeeper(ec2_client, key_name, sg_id, subnet_id, proxy_ip):
     # Script to configure the Gatekeeper with FastAPI to validate requests and forward to Trusted Host
     user_data_script_gatekeeper = f'''#!/bin/bash
     sudo apt update -y
-    sudo apt install -y python3-pip
+    sudo apt install -y python3-pip python3.12-venv python3-setuptools
     pip3 install fastapi uvicorn requests
-    cat << EOF > /home/ubuntu/gatekeeper_app.py
-    from fastapi import FastAPI, Request
-    import requests
+    cat << EOF > /home/ubuntu/app.py
+from fastapi import FastAPI
+import requests
+import random
+import subprocess
+import logging
+from pydantic import BaseModel
 
-    app = FastAPI()
+logging.basicConfig(
+    level=logging.INFO,  # Set the log level to INFO or DEBUG depending on your needs
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
 
-    # IP del Trusted Host para reenviar las solicitudes desde el Gatekeeper
-    trusted_host_ip = "{trusted_host_ip}"
+# Create a logger
+logger = logging.getLogger(__name__)
 
-    @app.post("/write")
-    async def write(request: Request):
-        data = await request.json()
-        response = requests.post(f"http://{{trusted_host_ip}}/write", json=data)
-        response2 = f"The status is: { {'status': 200, 'message': 'Request forwarded to proxy for write operation'} }"
-        return response2
+app = FastAPI()
 
-    @app.get("/read")
-    async def read():
-        response = requests.get(f"http://{{trusted_host_ip}}/read")
-        response2 = f"The status is: { {'status': 200, 'message': 'Request forwarded to proxy for write operation'} }"
-        return response2
+# Modelo Item
+class Item(BaseModel):
+    column1: str
+    column2: str
 
-    @app.get("/ping-read")
-    async def ping_read():
-        response = requests.get(f"http://{{trusted_host_ip}}/ping-read")
-        response2 = f"The status is: { {'status': 200, 'message': 'Request forwarded to proxy for write operation'} }"
-        return response2
+trusted_host_ip = "{trusted_host_ip}"
 
-    EOF
+@app.post("/write")
+def write(item: Item):
+    logger.info(f"Received write request with item: {{item}}")
+    response = requests.post(f"http://{trusted_host_ip}:8000/write", json=item.dict())
+    return response.json()
 
-    nohup uvicorn /home/ubuntu/gatekeeper_app:app --host 0.0.0.0 --port 80 &
+@app.get("/random-read/")
+def random_read(item_id: int):
+    response = requests.get(f"http://{trusted_host_ip}:8000/random-read/?item_id={{item_id}}")
+    return response.json()
+
+@app.get("/direct-read/")
+def direct_read(item_id: int):
+    response = requests.get(f"http://{trusted_host_ip}:8000/direct-read/?item_id={{item_id}}")
+    return response.json()
+
+@app.get("/ping-read/")
+def ping_read(item_id: int):
+    response = requests.get(f"http://{trusted_host_ip}:8000/ping-read/?item_id={{item_id}}")
+    return response.json()
+
+EOF
+
+    # Update package list
+    sudo apt update
+
+    # Install python3-venv if not installed
+    sudo apt install python3.12-venv
+
+    # Create the virtual environment
+    sudo python3 -m venv /home/ubuntu/myenv
+
+    # Activate the virtual environment
+    source /home/ubuntu/myenv/bin/activate
+
+    # Upgrade pip in the virtual environment
+    sudo /home/ubuntu/myenv/bin/pip install --upgrade pip
+
+    # Install the required Python packages
+    sudo /home/ubuntu/myenv/bin/pip install fastapi uvicorn mysql-connector-python requests
+
+    # Run the FastAPI application
+    cd /home/ubuntu
+    nohup /home/ubuntu/myenv/bin/uvicorn app:app --host 0.0.0.0 --port 8000 --reload &
+    
     '''
 
     # Launch the Gatekeeper instance
@@ -701,7 +776,7 @@ def setup_gatekeeper(ec2_client, key_name, sg_id, subnet_id, proxy_ip):
     print(f"Gatekeeper instance created with ID: {gatekeeper_instance_id} and IP: {gatekeeper_ip}")
 
     # Security configuration to ensure only Gatekeeper can communicate with Trusted Host
-    configure_gatekeeper_security(ec2_client, sg_id, trusted_host_ip)
+    #configure_gatekeeper_security(ec2_client, sg_id, trusted_host_ip)
 
     return gatekeeper_instance_id, trusted_host_instance_id
 
