@@ -302,7 +302,6 @@ EOF
 
     return manager_instance_id, manager_private_ip
 
-
 def setup_worker(ec2_client, key_name, sg_id, subnet_id, manager_private_ip, worker_name, server_id):
     instance_type = 't2.micro'
     ami_id = 'ami-0e86e20dae9224db8'
@@ -449,40 +448,79 @@ def setup_proxy(ec2_client, key_name, sg_id, subnet_id, manager_ip, worker_ips):
     sudo apt update -y
     sudo apt install -y python3-pip
     pip3 install fastapi uvicorn requests
-    cat << EOF > /home/ubuntu/proxy_app.py
+    cat << EOF > /home/ubuntu/app.py
 from fastapi import FastAPI
 import requests
 import random
 import subprocess
+from pydantic import BaseModel
 
 app = FastAPI()
+
+# Modelo Item
+class Item(BaseModel):
+    item_id: int
+    name: str
+    description: str
 
 manager_ip = "{manager_ip}"
 worker_ips = {worker_ips}
 
 @app.post("/write")
-def write():
-    response = requests.post(f"http://{{manager_ip}}/write")
-    return {{"status": response.status_code, "message": "Request forwarded to manager"}}
+def write(item: Item):
+    response = requests.post(f"http://{{manager_ip}}/insert_item", json=item.dict())
+    response2 = f"The status is: { {'status': 200, 'message': 'Request forwarded to proxy for write operation'} }"
+    return response2
 
-@app.get("/read")
-def read():
+@app.get("/random-read")
+def random_read(item_id: int):
     worker_ip = random.choice(worker_ips)
-    response = requests.get(f"http://{{worker_ip}}/read")
-    return {{"status": response.status_code, "message": f"Request forwarded to worker {{worker_ip}}" }}
+    response = requests.get(f"http://{{worker_ip}}/get_item/?item_id={{item_id}}")
+    response2 = f"The status is: { {'status': 200, 'message': 'Request forwarded to proxy for write operation'} }"
+    return response2
+
+@app.get("/direct-read")
+def direct_read(item_id: int):
+    worker_ip = worker_ips[0]
+    response = requests.get(f"http://{{worker_ip}}/get_item/?item_id={{item_id}}")
+    response2 = f"The status is: { {'status': 200, 'message': 'Request forwarded to proxy for write operation'} }"
+    return response2
 
 @app.get("/ping-read")
-def ping_read():
+def ping_read(item_id: int):
     ping_times = {{}}
     for worker_ip in worker_ips:
         ping_time = subprocess.check_output(["ping", "-c", "1", worker_ip]).decode().split("time=")[-1].split(" ")[0]
         ping_times[worker_ip] = float(ping_time)
     fastest_worker = min(ping_times, key=ping_times.get)
-    response = requests.get(f"http://{{fastest_worker}}/read")
-    return {{"status": response.status_code, "message": f"Request forwarded to fastest worker {{fastest_worker}}" }}
+    response = requests.get(f"http://{{fastest_worker}}/get_item/?item_id={{item_id}}")
+    response2 = f"The status is: { {'status': 200, 'message': 'Request forwarded to proxy for write operation'} }"
+    return response2
 
 EOF
-    nohup uvicorn /home/ubuntu/proxy_app:app --host 0.0.0.0 --port 80 --log-level info &
+
+    # Update package list
+    sudo apt update
+
+    # Install python3-venv if not installed
+    sudo apt install python3.12-venv
+
+    # Create the virtual environment
+    python3 -m venv /home/ubuntu/myenv
+
+    # Activate the virtual environment
+    source /home/ubuntu/myenv/bin/activate
+
+    # Upgrade pip in the virtual environment
+    /home/ubuntu/myenv/bin/pip install --upgrade pip
+
+    # Install the required Python packages
+    /home/ubuntu/myenv/bin/pip install fastapi uvicorn mysql-connector-python requests
+
+    # Run the FastAPI application
+    cd /home/ubuntu
+    nohup /home/ubuntu/myenv/bin/uvicorn app:app --host 0.0.0.0 --port 8000 --reload &
+    
     '''
     ami_id = 'ami-0e86e20dae9224db8'
 
@@ -504,6 +542,7 @@ EOF
     print(f"Proxy instance created with ID: {proxy_instance_id}")
 
     return proxy_instance_id
+
 
 def get_public_ip(instance_id):
     retries = 3
