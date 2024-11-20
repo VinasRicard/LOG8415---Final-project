@@ -479,32 +479,29 @@ def write(item: Item):
     logger.info(f"Received write request with item: {{item}}")
     response = requests.post(f"http://{manager_ip}:8000/insert_item/", json=item.dict())  # Fixed the f-string formatting
     logger.info(f"Successfully forwarded request to manager. Response: {{response.json()}}")
-    return {"message": "Item inserted successfully"}
+    return response.json()
 
-@app.get("/random-read")
+@app.get("/random-read/")
 def random_read(item_id: int):
     worker_ip = random.choice(worker_ips)
-    response = requests.get(f"http://{{worker_ip}}/get_item/?item_id={{item_id}}")
-    response2 = f"The status is: { {'status': 200, 'message': 'Request forwarded to proxy for write operation'} }"
-    return response2
+    response = requests.get(f"http://{{worker_ip}}:8000/get_item/?item_id={{item_id}}")
+    return response.json()
 
-@app.get("/direct-read")
+@app.get("/direct-read/")
 def direct_read(item_id: int):
     worker_ip = worker_ips[0]
-    response = requests.get(f"http://{{worker_ip}}/get_item/?item_id={{item_id}}")
-    response2 = f"The status is: { {'status': 200, 'message': 'Request forwarded to proxy for write operation'} }"
-    return response2
+    response = requests.get(f"http://{{worker_ip}}:8000/get_item/?item_id={{item_id}}")
+    return response.json()
 
-@app.get("/ping-read")
+@app.get("/ping-read/")
 def ping_read(item_id: int):
     ping_times = {{}}
     for worker_ip in worker_ips:
         ping_time = subprocess.check_output(["ping", "-c", "1", worker_ip]).decode().split("time=")[-1].split(" ")[0]
         ping_times[worker_ip] = float(ping_time)
     fastest_worker = min(ping_times, key=ping_times.get)
-    response = requests.get(f"http://{{fastest_worker}}/get_item/?item_id={{item_id}}")
-    response2 = f"The status is: { {'status': 200, 'message': 'Request forwarded to proxy for write operation'} }"
-    return response2
+    response = requests.get(f"http://{{fastest_worker}}:8000/get_item/?item_id={{item_id}}")
+    return response.json()
 
 EOF
 
