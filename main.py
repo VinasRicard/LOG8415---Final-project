@@ -477,10 +477,9 @@ worker_ips = {worker_ips}
 @app.post("/write")
 def write(item: Item):
     logger.info(f"Received write request with item: {{item}}")
-    response = requests.post(f"http://{manager_ip}/insert_item", json=item.dict())  # Fixed the f-string formatting
+    response = requests.post(f"http://{manager_ip}:8000/insert_item/", json=item.dict())  # Fixed the f-string formatting
     logger.info(f"Successfully forwarded request to manager. Response: {{response.json()}}")
-    response2 = f"The status is: {{'status': 200, 'message': 'Request forwarded to proxy for write operation'}}"
-    return response2
+    return {"message": "Item inserted successfully"}
 
 @app.get("/random-read")
 def random_read(item_id: int):
