@@ -446,30 +446,40 @@ def setup_mysql_cluster(ec2_client, key_name, sg_id, subnet_id):
 def setup_proxy(ec2_client, key_name, sg_id, subnet_id, manager_ip, worker_ips):
     user_data_script_proxy = f'''#!/bin/bash
     sudo apt update -y
-    sudo apt install -y python3-pip
+    sudo apt install -y python3-pip python3.12-venv python3-setuptools
     pip3 install fastapi uvicorn requests
     cat << EOF > /home/ubuntu/app.py
 from fastapi import FastAPI
 import requests
 import random
 import subprocess
+import logging
 from pydantic import BaseModel
+
+logging.basicConfig(
+    level=logging.INFO,  # Set the log level to INFO or DEBUG depending on your needs
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+
+# Create a logger
+logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
 # Modelo Item
 class Item(BaseModel):
-    item_id: int
-    name: str
-    description: str
+    column1: str
+    column2: str
 
 manager_ip = "{manager_ip}"
 worker_ips = {worker_ips}
 
 @app.post("/write")
 def write(item: Item):
-    response = requests.post(f"http://{{manager_ip}}/insert_item", json=item.dict())
-    response2 = f"The status is: { {'status': 200, 'message': 'Request forwarded to proxy for write operation'} }"
+    logger.info(f"Received write request with item: {{item}}")
+    response = requests.post(f"http://{manager_ip}/insert_item", json=item.dict())  # Fixed the f-string formatting
+    logger.info(f"Successfully forwarded request to manager. Response: {{response.json()}}")
+    response2 = f"The status is: {{'status': 200, 'message': 'Request forwarded to proxy for write operation'}}"
     return response2
 
 @app.get("/random-read")
@@ -506,16 +516,16 @@ EOF
     sudo apt install python3.12-venv
 
     # Create the virtual environment
-    python3 -m venv /home/ubuntu/myenv
+    sudo python3 -m venv /home/ubuntu/myenv
 
     # Activate the virtual environment
     source /home/ubuntu/myenv/bin/activate
 
     # Upgrade pip in the virtual environment
-    /home/ubuntu/myenv/bin/pip install --upgrade pip
+    sudo /home/ubuntu/myenv/bin/pip install --upgrade pip
 
     # Install the required Python packages
-    /home/ubuntu/myenv/bin/pip install fastapi uvicorn mysql-connector-python requests
+    sudo /home/ubuntu/myenv/bin/pip install fastapi uvicorn mysql-connector-python requests
 
     # Run the FastAPI application
     cd /home/ubuntu
