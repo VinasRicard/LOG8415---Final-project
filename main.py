@@ -564,8 +564,30 @@ def get_public_ip(instance_id):
                 raise e
     raise Exception(f"Unable to retrieve public IP for instance {instance_id} after {retries} retries.")
 
+def get_private_ip(instance_id):
+    """
+    Retrieve the private IP address of an EC2 instance.
+    Args:
+        instance_id: The ID of the EC2 instance.
+    Returns:
+        Private IP address of the instance.
+    """
+    retries = 3
+    for i in range(retries):
+        try:
+            instance_description = ec2_client.describe_instances(InstanceIds=[instance_id])
+            private_ip = instance_description['Reservations'][0]['Instances'][0].get('PrivateIpAddress')
+            return private_ip
+        except botocore.exceptions.ClientError as e:
+            if e.response['Error']['Code'] == 'InvalidInstanceID.NotFound':
+                print(f"Instance {instance_id} not found. Retrying in 30 seconds...")
+                time.sleep(30)
+            else:
+                raise e
+    raise Exception(f"Unable to retrieve private IP for instance {instance_id} after {retries} retries.")
+
 # Set up the gatekeeper
-def setup_gatekeeper(ec2_client, key_name, sg_id, subnet_id, proxy_ip):
+def setup_gatekeeper(ec2_client, key_name, public_sg_id, private_sg_id, subnet_id, proxy_ip):
     """
     Deploy the Gatekeeper and Trusted Host instances and configure them with FastAPI to securely handle requests.
     Args:
@@ -661,7 +683,7 @@ EOF
         InstanceType='t2.large',
         KeyName=key_name,
         ImageId=ami_id,
-        SecurityGroupIds=[sg_id],
+        SecurityGroupIds=[private_sg_id],
         SubnetId=subnet_id,
         MinCount=1,
         MaxCount=1,
@@ -673,7 +695,7 @@ EOF
     )
     trusted_host_instance_id = trusted_host_instance['Instances'][0]['InstanceId']
     ec2_client.get_waiter('instance_running').wait(InstanceIds=[trusted_host_instance_id])
-    trusted_host_ip = get_public_ip(trusted_host_instance_id)
+    trusted_host_ip = get_private_ip(trusted_host_instance_id)
     print(f"Trusted Host instance created with ID: {trusted_host_instance_id} and IP: {trusted_host_ip}")
 
     # Script to configure the Gatekeeper with FastAPI to validate requests and forward to Trusted Host
@@ -760,7 +782,7 @@ EOF
         InstanceType='t2.large',
         KeyName=key_name,
         ImageId=ami_id,
-        SecurityGroupIds=[sg_id],
+        SecurityGroupIds=[public_sg_id],
         SubnetId=subnet_id,
         MinCount=1,
         MaxCount=1,
@@ -815,6 +837,140 @@ def benchmark_cluster(manager_instance_id, worker_instance_ids, proxy_instance_i
         # Send a read request to proxy for load-balanced reading
         requests.get(f"http://{proxy_instance_id}/read")
 '''
+
+def create_public_security_group(ec2_client, vpc_id, description="Public Security Group"):
+    """
+    Create or reuse a security group that allows public access (e.g., SSH, HTTP).
+    Args:
+        ec2_client: The boto3 EC2 client.
+        vpc_id: VPC id.
+        description: Description for the security group.
+    Returns:
+        Security group ID.
+    """
+    group_name = "public-security-group"
+    inbound_rules = [
+        {'protocol': 'tcp', 'port_range': 22, 'source': '0.0.0.0/0'},  # SSH
+        {'protocol': 'tcp', 'port_range': 80, 'source': '0.0.0.0/0'},  # HTTP
+        {'protocol': 'tcp', 'port_range': 443, 'source': '0.0.0.0/0'},  # HTTPS
+        {'protocol': 'all', 'port_range': 443, 'source': '0.0.0.0/0'},
+        {'protocol': 'all', 'port_range': (0, 65535), 'source': '0.0.0.0/0'}  # All
+    ]
+
+    try:
+        # Check if the security group already exists
+        response = ec2_client.describe_security_groups(
+            Filters=[
+                {'Name': 'group-name', 'Values': [group_name]},
+                {'Name': 'vpc-id', 'Values': [vpc_id]}
+            ]
+        )
+        if response['SecurityGroups']:
+            security_group_id = response['SecurityGroups'][0]['GroupId']
+            print(f"Using existing Public Security Group ID: {security_group_id}")
+            return security_group_id
+
+        # Create the security group
+        print(f"Creating security group {group_name} in VPC ID: {vpc_id}")
+        response = ec2_client.create_security_group(
+            GroupName=group_name,
+            Description=description,
+            VpcId=vpc_id
+        )
+        security_group_id = response['GroupId']
+        print(f"Created Public Security Group ID: {security_group_id}")
+
+        # Set inbound rules
+        ip_permissions = []
+        for rule in inbound_rules:
+            ip_permissions.append({
+                'IpProtocol': rule['protocol'],
+                'FromPort': rule['port_range'],
+                'ToPort': rule['port_range'],
+                'IpRanges': [{'CidrIp': rule['source']}]
+            })
+
+        # Add inbound rules
+        ec2_client.authorize_security_group_ingress(
+            GroupId=security_group_id,
+            IpPermissions=ip_permissions
+        )
+
+        return security_group_id
+
+    except ClientError as e:
+        print(f"Error creating Public Security Group: {e}")
+        return None
+
+def create_private_security_group(ec2_client, vpc_id, public_security_group_id, description="Private Security Group"):
+    """
+    Create or reuse a security group that allows private access only.
+    Args:
+        ec2_client: The boto3 EC2 client.
+        vpc_id: VPC id.
+        public_security_group_id: ID of the public security group for allowed access.
+        description: Description for the security group.
+    Returns:
+        Security group ID.
+    """
+    group_name = "private-security-group"
+
+    try:
+        # Check if the security group already exists
+        response = ec2_client.describe_security_groups(
+            Filters=[
+                {'Name': 'group-name', 'Values': [group_name]},
+                {'Name': 'vpc-id', 'Values': [vpc_id]}
+            ]
+        )
+        if response['SecurityGroups']:
+            security_group_id = response['SecurityGroups'][0]['GroupId']
+            print(f"Using existing Private Security Group ID: {security_group_id}")
+            return security_group_id
+
+        # Create the security group
+        print(f"Creating security group {group_name} in VPC ID: {vpc_id}")
+        response = ec2_client.create_security_group(
+            GroupName=group_name,
+            Description=description,
+            VpcId=vpc_id
+        )
+        security_group_id = response['GroupId']
+        print(f"Created Private Security Group ID: {security_group_id}")
+
+        # Set inbound rules
+        ip_permissions = [
+            {
+                'IpProtocol': 'tcp',
+                'FromPort': 0,
+                'ToPort': 8000,
+                'UserIdGroupPairs': [{'GroupId': public_security_group_id}]
+            },
+            {
+                'IpProtocol': 'tcp',
+                'FromPort': 0,
+                'ToPort': 8000,
+                'UserIdGroupPairs': [{'GroupId': security_group_id}]  # Self-reference for private communication
+            },
+            {
+                'IpProtocol': '-1',  # -1 representa "All traffic" (todos los protocolos)
+                'FromPort': 0,
+                'ToPort': 65535,  # Permite todos los puertos (de 0 a 65535)
+                'UserIdGroupPairs': [{'GroupId': security_group_id}]  # Referencia al grupo de seguridad de origen
+            }
+        ]
+
+        # Add inbound rules
+        ec2_client.authorize_security_group_ingress(
+            GroupId=security_group_id,
+            IpPermissions=ip_permissions
+        )
+
+        return security_group_id
+
+    except ClientError as e:
+        print(f"Error creating Private Security Group: {e}")
+        return None
         
 # File with the IDs of the instances
 INSTANCE_FILE = "instance_ids.json"
@@ -838,20 +994,22 @@ def main():
     subnet_id = get_subnet(ec2_client, vpc_id)
 
     # Step 3: Security Group creation
-    sg_id = create_security_group(ec2_client, vpc_id)
+    #sg_id = create_security_group(ec2_client, vpc_id)
+    public_sg_id = create_public_security_group(ec2_client, vpc_id)
+    private_sg_id = create_private_security_group(ec2_client, vpc_id, public_sg_id)
 
     # Step 4: Deploy MySQL instances (manager + 2 workers)
-    manager_instance_id, worker_instance_ids = setup_mysql_cluster(ec2_client, key_name, sg_id, subnet_id)
+    manager_instance_id, worker_instance_ids = setup_mysql_cluster(ec2_client, key_name, private_sg_id, subnet_id)
     save_instance_ids(manager_instance_id, worker_instance_ids)
 
     # Step 5: Set up the proxy instance and configure load balancing
-    manager_ip = get_public_ip(manager_instance_id)
-    worker_ips = [get_public_ip(worker_id) for worker_id in worker_instance_ids]
-    proxy_instance_id = setup_proxy(ec2_client, key_name, sg_id, subnet_id, manager_ip, worker_ips)
+    manager_ip = get_private_ip(manager_instance_id)
+    worker_ips = [get_private_ip(worker_id) for worker_id in worker_instance_ids]
+    proxy_instance_id = setup_proxy(ec2_client, key_name, private_sg_id, subnet_id, manager_ip, worker_ips)
 
     # Step 6: Set up the gatekeeper pattern
-    proxy_ip = get_public_ip(proxy_instance_id)
-    gatekeeper_instance_id, trusted_host_id = setup_gatekeeper(ec2_client, key_name, sg_id, subnet_id, proxy_ip)
+    proxy_ip = get_private_ip(proxy_instance_id)
+    gatekeeper_instance_id, trusted_host_id = setup_gatekeeper(ec2_client, key_name, public_sg_id, private_sg_id, subnet_id, proxy_ip)
 
     # Step 7: Send benchmarking requests
     # benchmark_cluster(manager_instance_id, worker_instance_ids, proxy_instance_id)
