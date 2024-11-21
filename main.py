@@ -9,6 +9,7 @@ import subprocess
 import requests
 import time
 import botocore.exceptions
+import logging
 
 # Initialize clients
 ec2_client = boto3.client('ec2', region_name='us-east-1')
@@ -823,20 +824,59 @@ def configure_gatekeeper_security(ec2_client, sg_id, trusted_host_ip):
     )
     '''
 
+# Set up logging configuration
+logging.basicConfig(filename='benchmark_log.txt', level=logging.INFO, 
+                    format='%(asctime)s - %(levelname)s - %(message)s')
+
 # Benchmarking
-'''
-def benchmark_cluster(manager_instance_id, worker_instance_ids, proxy_instance_id):
+def benchmark_cluster(gatekeeper_ip):
     """
     Sends 1000 read and 1000 write requests to the MySQL cluster.
     """
+    num_rows = 50
     for _ in range(1000):
-        # Send a write request to manager
-        requests.post(f"http://{manager_instance_id}/write", data={'key': 'value'})
+        item_id = random.randint(1, num_rows)  # Random item_id within the range of your rows
+        try:
+            response = requests.get(f"http://{gatekeeper_ip}:8000/ping-read/?item_id={item_id}")
+            response.raise_for_status()  # Raise an exception for HTTP errors
+            logging.info(f"ping-read success - item_id={item_id}, status_code={response.status_code}")
+        except requests.exceptions.RequestException as e:
+            logging.error(f"ping-read error - item_id={item_id}, error={str(e)}")
+    
+    for _ in range(1000):
+        item_id = random.randint(1, num_rows)  # Random item_id for random-read
+        try:
+            response = requests.get(f"http://{gatekeeper_ip}:8000/random-read/?item_id={item_id}")
+            response.raise_for_status()
+            logging.info(f"random-read success - item_id={item_id}, status_code={response.status_code}")
+        except requests.exceptions.RequestException as e:
+            logging.error(f"random-read error - item_id={item_id}, error={str(e)}")
+    
+    for _ in range(1000):
+        item_id = random.randint(1, num_rows)  # Random item_id for direct-read
+        try:
+            response = requests.get(f"http://{gatekeeper_ip}:8000/direct-read/?item_id={item_id}")
+            response.raise_for_status()
+            logging.info(f"direct-read success - item_id={item_id}, status_code={response.status_code}")
+        except requests.exceptions.RequestException as e:
+            logging.error(f"direct-read error - item_id={item_id}, error={str(e)}")
 
+    # Send 1000 POST requests with dynamic column1, column2 values for write requests
     for _ in range(1000):
-        # Send a read request to proxy for load-balanced reading
-        requests.get(f"http://{proxy_instance_id}/read")
-'''
+        column1 = f"Name{random.randint(1, 100)}"
+        column2 = f"Surname{random.randint(1, 100)}"
+        data = {
+            'column1': column1,
+            'column2': column2
+        }
+        headers = {'Content-Type': 'application/json'}
+        try:
+            response = requests.post(f"http://{gatekeeper_ip}:8000/write", data=json.dumps(data), headers=headers)
+            response.raise_for_status()
+            logging.info(f"write success - column1={column1}, column2={column2}, status_code={response.status_code}")
+        except requests.exceptions.RequestException as e:
+            logging.error(f"write error - column1={column1}, column2={column2}, error={str(e)}")
+
 
 def create_public_security_group(ec2_client, vpc_id, description="Public Security Group"):
     """
@@ -1012,7 +1052,9 @@ def main():
     gatekeeper_instance_id, trusted_host_id = setup_gatekeeper(ec2_client, key_name, public_sg_id, private_sg_id, subnet_id, proxy_ip)
 
     # Step 7: Send benchmarking requests
-    # benchmark_cluster(manager_instance_id, worker_instance_ids, proxy_instance_id)
+    time.sleep(120)
+    gatekeeper_ip = get_public_ip(gatekeeper_instance_id)
+    benchmark_cluster(gatekeeper_ip)
 
 if __name__ == "__main__":
     main()
