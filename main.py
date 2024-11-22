@@ -550,6 +550,7 @@ EOF
 
     return proxy_instance_id
 
+# Get the public ip of an instance
 def get_public_ip(instance_id):
     retries = 3
     for i in range(retries):
@@ -565,6 +566,7 @@ def get_public_ip(instance_id):
                 raise e
     raise Exception(f"Unable to retrieve public IP for instance {instance_id} after {retries} retries.")
 
+# Get the private ip of an instance
 def get_private_ip(instance_id):
     """
     Retrieve the private IP address of an EC2 instance.
@@ -803,27 +805,6 @@ EOF
 
     return gatekeeper_instance_id, trusted_host_instance_id
 
-# Configure the gatekeeper security
-def configure_gatekeeper_security(ec2_client, sg_id, trusted_host_ip):
-    '''
-    ec2_client.authorize_security_group_ingress(
-        GroupId=sg_id,
-        IpPermissions=[
-            {
-                'IpProtocol': 'tcp',  # Example: Allowing TCP protocol
-                'FromPort': 22,       # Example: Allowing SSH (port 22)
-                'ToPort': 22,         # Example: Allowing SSH (port 22)
-                'IpRanges': [
-                    {
-                        'CidrIp': trusted_host_ip,  # Use trusted_host_ip here
-                        'Description': 'SSH access from trusted host'
-                    }
-                ]
-            }
-        ]
-    )
-    '''
-
 # Set up logging configuration
 logging.basicConfig(filename='benchmark_log.txt', level=logging.INFO, 
                     format='%(asctime)s - %(levelname)s - %(message)s')
@@ -877,7 +858,7 @@ def benchmark_cluster(gatekeeper_ip):
         except requests.exceptions.RequestException as e:
             logging.error(f"write error - column1={column1}, column2={column2}, error={str(e)}")
 
-
+# Security group for the Gatekeeper
 def create_public_security_group(ec2_client, vpc_id, description="Public Security Group"):
     """
     Create or reuse a security group that allows public access (e.g., SSH, HTTP).
@@ -942,6 +923,7 @@ def create_public_security_group(ec2_client, vpc_id, description="Public Securit
         print(f"Error creating Public Security Group: {e}")
         return None
 
+# Security group for all the private instances
 def create_private_security_group(ec2_client, vpc_id, public_security_group_id, description="Private Security Group"):
     """
     Create or reuse a security group that allows private access only.
@@ -1034,7 +1016,6 @@ def main():
     subnet_id = get_subnet(ec2_client, vpc_id)
 
     # Step 3: Security Group creation
-    #sg_id = create_security_group(ec2_client, vpc_id)
     public_sg_id = create_public_security_group(ec2_client, vpc_id)
     private_sg_id = create_private_security_group(ec2_client, vpc_id, public_sg_id)
 
